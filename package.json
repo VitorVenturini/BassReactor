@@ -1,0 +1,64 @@
+{
+  "name": "bass-reactor-vue",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "main": "electron/main.mjs",
+  "scripts": {
+    "dev": "vite",
+    "dev:web": "vite",
+    "dev:desktop": "concurrently -k \"vite --host 127.0.0.1 --port 5173\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "clean:release": "node -e \"const fs=require('node:fs'); ['release','release-new'].forEach((dir)=>fs.rmSync(dir,{recursive:true,force:true}));\"",
+    "build": "vite build",
+    "preview": "vite preview",
+    "desktop": "npm run build && electron .",
+    "dist:win": "npm run clean:release && npm run build && cross-env CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --win portable --x64"
+  },
+  "build": {
+    "appId": "com.bassreactor.desktop",
+    "productName": "Bass Reactor",
+    "npmRebuild": false,
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "extraMetadata": {
+      "main": "electron/main.mjs"
+    },
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Bass-Reactor-${version}-portable-${arch}.${ext}"
+    }
+  },
+  "dependencies": {
+    "@tresjs/core": "4.3.6",
+    "@vueuse/core": "13.3.0",
+    "@wearesage/shared": "1.4.4",
+    "@wearesage/vue": "^4.2.999999999",
+    "pinia": "3.0.3",
+    "three": "0.173.0",
+    "vue": "3.5.17"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "5.2.4",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^40.7.0",
+    "electron-builder": "^26.8.1",
+    "vite": "6.3.5",
+    "wait-on": "^9.0.4"
+  }
+}

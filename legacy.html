@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DJ Visualizer Legacy</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <canvas id="visualizer"></canvas>
+
+    <main class="panel">
+      <h1>Bass Reactor</h1>
+      <p class="hint">
+        Versao legacy do visualizer. Clique em <strong>Permitir audio do desktop</strong> e marque
+        <strong>Compartilhar audio</strong>.
+      </p>
+
+      <div class="controls">
+        <button id="captureBtn" class="primary">Permitir audio do desktop</button>
+        <button id="pauseBtn">Pausar</button>
+        <button id="stopBtn">Parar</button>
+        <button id="fullscreenBtn">Tela cheia</button>
+        <button id="popupBtn">Abrir Pop-up</button>
+        <button id="toggleUiBtn">Ocultar UI</button>
+      </div>
+
+      <div class="auto-stats">
+        <article class="stat-card">
+          <span>Intensidade</span>
+          <strong id="intensityValue">0%</strong>
+        </article>
+        <article class="stat-card">
+          <span>Preset</span>
+          <strong id="presetValue">Boot</strong>
+        </article>
+        <article class="stat-card">
+          <span>Cena</span>
+          <strong id="sceneValue">STEADY</strong>
+        </article>
+      </div>
+
+      <section class="mode-tester" aria-label="Teste manual dos visuais">
+        <label class="mode-tester-label">
+          Teste de visual
+          <select id="modeSelect">
+            <option value="mirror">Mirror</option>
+            <option value="mirrorstorm">Mirror Storm</option>
+            <option value="mirrorvoid">Mirror Void</option>
+            <option value="mirrorpulse">Mirror Pulse</option>
+            <option value="shards">Shards</option>
+            <option value="shardbloom">Shard Bloom</option>
+            <option value="shardnova">Shard Nova</option>
+            <option value="starorbit">Star Orbit</option>
+            <option value="startrail">Star Trail</option>
+            <option value="starburst">Star Burst</option>
+            <option value="reactor3d">Reactor 3D</option>
+            <option value="reactorpoly">Reactor Poly</option>
+            <option value="reactorhelix">Reactor Helix</option>
+            <option value="reactorlattice">Reactor Lattice</option>
+            <option value="gridflux">Grid Flux</option>
+            <option value="gridsun">Grid Sun</option>
+            <option value="gridrush">Grid Rush</option>
+            <option value="pixeldrive">Pixel Drive</option>
+            <option value="osc">Osc Scope</option>
+            <option value="oscmid">Osc Midline</option>
+            <option value="oscmulti">Osc Multi</option>
+            <option value="osccolor">Osc Colors</option>
+          </select>
+        </label>
+        <p class="mode-tester-hint">
+          Ao trocar aqui, o auto modo desliga para voce testar cada visual isoladamente.
+        </p>
+      </section>
+
+      <div class="grid advanced-hidden" aria-hidden="true">
+        <label>
+          Cores psicodelicas
+          <select id="colorModeSelect">
+            <option value="flow">Flow</option>
+            <option value="wild" selected>Wild</option>
+            <option value="chaos">Chaos</option>
+          </select>
+        </label>
+
+        <label>
+          Sensibilidade
+          <input id="sensitivity" type="range" min="0.8" max="4.8" step="0.1" value="2.4" />
+        </label>
+
+        <label>
+          Impacto bass
+          <input id="impact" type="range" min="0.8" max="4.2" step="0.1" value="2.8" />
+        </label>
+
+        <label>
+          Rastro
+          <input id="trail" type="range" min="0.12" max="0.95" step="0.01" value="0.62" />
+        </label>
+
+        <label>
+          Suavizacao
+          <input id="smoothing" type="range" min="0" max="0.95" step="0.01" value="0.62" />
+        </label>
+
+        <label>
+          Auto modo
+          <select id="autoModeSelect">
+            <option value="off">Off</option>
+            <option value="adaptive" selected>Drop/Calm</option>
+            <option value="time_16000">Tempo 16s</option>
+            <option value="hybrid">Hibrido</option>
+          </select>
+        </label>
+
+        <label>
+          Mix inteligente
+          <select id="smartMixSelect">
+            <option value="on" selected>On</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+
+        <label>
+          Drop rapido
+          <input id="dropBoost" type="range" min="0.8" max="2.8" step="0.1" value="1.8" />
+        </label>
+
+        <label>
+          Pacote FX
+          <select id="fxSelect">
+            <option value="raw">Raw</option>
+            <option value="flash">Flash</option>
+            <option value="impact" selected>Impact</option>
+            <option value="full">Full</option>
+          </select>
+        </label>
+      </div>
+
+      <p id="status" class="status">
+        Modo automatico ativo. Conecte o audio e deixe o visualizer trabalhar.
+      </p>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

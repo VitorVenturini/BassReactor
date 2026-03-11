@@ -1,0 +1,242 @@
+import { onBeforeUnmount, ref } from "vue";
+
+function clamp(value, min = 0, max = 1) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function roundLevel(value) {
+  return Number(value.toFixed(3));
+}
+
+export function useDesktopAudio() {
+  const streamHandle = ref(null);
+  const audioContext = ref(null);
+  const analyserNode = ref(null);
+  const sourceNode = ref(null);
+  const running = ref(false);
+  const busy = ref(false);
+  const status = ref("Conecte o audio do desktop para alimentar o visualizer.");
+  const error = ref(false);
+  const bass = ref(0);
+  const mids = ref(0);
+  const highs = ref(0);
+  const motionAmount = ref(0);
+  const motionStream = ref(0);
+  const blink = ref(0);
+  const colorIntensity = ref(0);
+  let frequencyData = null;
+  let lastTickAt = 0;
+  let previousBass = 0;
+  let previousMids = 0;
+  let previousHighs = 0;
+
+  function isElectronRuntime() {
+    return Boolean(window.bassReactorElectron?.isElectron);
+  }
+
+  function stop(stopTracks = true) {
+    if (stopTracks && streamHandle.value) {
+      streamHandle.value.getTracks().forEach((track) => track.stop());
+    }
+
+    if (sourceNode.value) {
+      try {
+        sourceNode.value.disconnect();
+      } catch {}
+    }
+
+    if (analyserNode.value) {
+      try {
+        analyserNode.value.disconnect();
+      } catch {}
+    }
+
+    if (audioContext.value && audioContext.value.state !== "closed") {
+      audioContext.value.close().catch(() => {});
+    }
+
+    sourceNode.value = null;
+    analyserNode.value = null;
+    audioContext.value = null;
+    streamHandle.value = null;
+    running.value = false;
+    bass.value = 0;
+    mids.value = 0;
+    highs.value = 0;
+    motionAmount.value = 0;
+    motionStream.value = 0;
+    blink.value = 0;
+    colorIntensity.value = 0;
+    frequencyData = null;
+    lastTickAt = 0;
+    previousBass = 0;
+    previousMids = 0;
+    previousHighs = 0;
+  }
+
+  async function connectDesktop() {
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      error.value = true;
+      status.value = "Este navegador nao suporta captura de audio do desktop.";
+      return;
+    }
+
+    busy.value = true;
+    error.value = false;
+    status.value = "Aguardando permissao de captura...";
+
+    try {
+      stop(true);
+
+      let nextStream;
+      if (isElectronRuntime()) {
+        status.value = "Capturando audio do sistema via Electron...";
+        nextStream = await navigator.mediaDevices.getDisplayMedia({
+          video: true,
+          audio: true,
+        });
+      } else {
+        try {
+          nextStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: {
+              autoGainControl: false,
+              echoCancellation: false,
+              noiseSuppression: false,
+            },
+            systemAudio: "include",
+          });
+        } catch {
+          nextStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: true,
+          });
+        }
+      }
+
+      const [audioTrack] = nextStream.getAudioTracks();
+      if (!audioTrack) {
+        nextStream.getTracks().forEach((track) => track.stop());
+        if (isElectronRuntime()) {
+          throw new Error("Nenhum audio do sistema foi capturado. Confirme se existe som sendo reproduzido na saida padrao do Windows.");
+        }
+        throw new Error("Nenhum audio foi compartilhado. Ative 'Compartilhar audio' na janela do navegador.");
+      }
+
+      const ctx = new AudioContext();
+      await ctx.resume();
+
+      const nextAnalyser = ctx.createAnalyser();
+      nextAnalyser.fftSize = 1024;
+      nextAnalyser.smoothingTimeConstant = 0;
+
+      const nextSource = ctx.createMediaStreamSource(nextStream);
+      nextSource.connect(nextAnalyser);
+
+      streamHandle.value = nextStream;
+      audioContext.value = ctx;
+      analyserNode.value = nextAnalyser;
+      sourceNode.value = nextSource;
+      frequencyData = new Uint8Array(nextAnalyser.frequencyBinCount);
+      running.value = true;
+      status.value = "Captura ativa. O renderer Vue agora usa o stack visual do Kaleidosync com audio do desktop.";
+
+      nextStream.getTracks().forEach((track) => {
+        track.addEventListener("ended", () => {
+          stop(false);
+          status.value = "A captura foi encerrada.";
+        });
+      });
+    } catch (caughtError) {
+      const message = caughtError instanceof Error ? caughtError.message : "Falha ao iniciar a captura.";
+      stop(true);
+      error.value = true;
+      status.value = message;
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  let rafId = 0;
+
+  function getBandAverage(startHz, endHz) {
+    if (!analyserNode.value || !audioContext.value || !frequencyData) return 0;
+
+    const nyquist = audioContext.value.sampleRate / 2;
+    const binCount = frequencyData.length;
+    const startBin = Math.max(0, Math.floor((startHz / nyquist) * binCount));
+    const endBin = Math.min(binCount, Math.ceil((endHz / nyquist) * binCount));
+    if (endBin <= startBin) return 0;
+
+    let sum = 0;
+    for (let index = startBin; index < endBin; index += 1) {
+      sum += frequencyData[index];
+    }
+
+    return sum / Math.max(1, endBin - startBin) / 255;
+  }
+
+  function tick() {
+    if (running.value) {
+      try {
+        const now = window.performance.now();
+        const frameDelta = lastTickAt ? now - lastTickAt : 1000 / 60;
+        lastTickAt = now;
+
+        if (analyserNode.value && frequencyData) {
+          analyserNode.value.getByteFrequencyData(frequencyData);
+          bass.value = roundLevel(getBandAverage(20, 160));
+          mids.value = roundLevel(getBandAverage(160, 2200));
+          highs.value = roundLevel(getBandAverage(2200, 12000));
+
+          const bassAttack = Math.max(0, bass.value - previousBass);
+          const midsAttack = Math.max(0, mids.value - previousMids);
+          const highsAttack = Math.max(0, highs.value - previousHighs);
+          const frameScale = frameDelta / (1000 / 60);
+          const nextMotionAmount = clamp(bass.value * 0.56 + bassAttack * 1.08, 0, 0.72);
+          const nextBlink = clamp(mids.value * 0.86 + midsAttack * 1.75, 0, 1.15);
+          const nextColor = clamp(highs.value * 0.94 + highsAttack * 1.4, 0, 1.2);
+
+          motionAmount.value = roundLevel(clamp(motionAmount.value * 0.72 + nextMotionAmount * 0.28, 0, 0.72));
+          motionStream.value = roundLevel(motionStream.value + motionAmount.value * (0.14 + bass.value * 0.42) * frameScale);
+          blink.value = roundLevel(clamp(blink.value * 0.48 + nextBlink * 0.72, 0, 1.15));
+          colorIntensity.value = roundLevel(clamp(colorIntensity.value * 0.72 + nextColor * 0.4, 0, 1.2));
+
+          previousBass = bass.value;
+          previousMids = mids.value;
+          previousHighs = highs.value;
+        }
+      } catch (caughtError) {
+        running.value = false;
+        error.value = true;
+        status.value = caughtError instanceof Error ? caughtError.message : "Falha ao processar o audio do desktop.";
+      }
+    }
+    rafId = window.requestAnimationFrame(tick);
+  }
+
+  if (typeof window !== "undefined") {
+    rafId = window.requestAnimationFrame(tick);
+  }
+
+  onBeforeUnmount(() => {
+    window.cancelAnimationFrame(rafId);
+    stop(true);
+  });
+
+  return {
+    bass,
+    mids,
+    highs,
+    motionAmount,
+    motionStream,
+    blink,
+    colorIntensity,
+    running,
+    busy,
+    status,
+    error,
+    connectDesktop,
+    stop,
+  };
+}

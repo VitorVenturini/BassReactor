@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bass Reactor Apps</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #05070d;
+        --panel: rgba(10, 16, 28, 0.82);
+        --line: rgba(201, 220, 244, 0.16);
+        --text: #eff6ff;
+        --muted: #9bb0c8;
+        --accent-a: #ff7a18;
+        --accent-b: #ffd447;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        min-height: 100%;
+      }
+
+      body {
+        font-family: "Space Grotesk", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(80rem 60rem at -10% 0%, rgba(255, 122, 24, 0.18), transparent 58%),
+          radial-gradient(70rem 70rem at 110% 100%, rgba(60, 148, 255, 0.14), transparent 56%),
+          linear-gradient(180deg, #04060b, var(--bg));
+        display: grid;
+        place-items: center;
+        padding: 1.5rem;
+      }
+
+      .chooser {
+        width: min(960px, 100%);
+        padding: 1.2rem;
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        background: var(--panel);
+        backdrop-filter: blur(18px);
+        box-shadow: 0 30px 90px rgba(0, 0, 0, 0.42);
+      }
+
+      .chooser h1 {
+        margin: 0;
+        font-family: "Bebas Neue", sans-serif;
+        font-size: clamp(3rem, 8vw, 5rem);
+        letter-spacing: 0.08em;
+        line-height: 0.9;
+      }
+
+      .chooser p {
+        margin: 0.6rem 0 0;
+        color: var(--muted);
+        max-width: 66ch;
+      }
+
+      .grid {
+        margin-top: 1.25rem;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 1rem;
+      }
+
+      .card {
+        display: grid;
+        gap: 0.8rem;
+        padding: 1rem;
+        border-radius: 20px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      .card strong {
+        font-size: 1.2rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .card small {
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+      }
+
+      .actions {
+        display: flex;
+        gap: 0.7rem;
+        flex-wrap: wrap;
+      }
+
+      .button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 180px;
+        padding: 0.85rem 1rem;
+        border-radius: 14px;
+        text-decoration: none;
+        font-weight: 700;
+        letter-spacing: 0.03em;
+        color: #130600;
+        background: linear-gradient(125deg, var(--accent-a), var(--accent-b));
+      }
+
+      .button.alt {
+        color: var(--text);
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      @media (max-width: 760px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="chooser">
+      <small>Escolha a versao</small>
+      <h1>Bass Reactor</h1>
+      <p>
+        Este projeto agora tem duas apps separadas: uma versao legada estatica como a original e outra
+        versao Vue inspirada na arquitetura do Kaleidosync.
+      </p>
+
+      <div class="grid">
+        <section class="card">
+          <small>App 1</small>
+          <strong>Legacy</strong>
+          <p>Interface antiga, HTML/CSS/JS direto, sem shell Vue. Boa para comparar com o comportamento original.</p>
+          <div class="actions">
+            <a class="button" href="/legacy.html">Abrir Legacy</a>
+          </div>
+        </section>
+
+        <section class="card">
+          <small>App 2</small>
+          <strong>Vue</strong>
+          <p>Nova shell em Vue 3 + Vite, mantendo o motor visual atual em canvas como camada de render.</p>
+          <div class="actions">
+            <a class="button" href="/vue.html">Abrir Vue</a>
+          </div>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>
