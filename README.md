@@ -1,5 +1,8 @@
 # DJ Visualizer
 
+> Esta branch (`web`) e focada na versao web para deploy na Vercel.
+> A versao desktop (Electron) esta na branch `app`.
+
 O projeto agora tem duas apps separadas:
 
 - `legacy.html`: versao antiga, estatica, no estilo original HTML + CSS + JS.
@@ -35,14 +38,10 @@ npm run dev
 - `http://localhost:5173/legacy.html` para a versao antiga
 - `http://localhost:5173/vue.html` para a versao Vue
 
-## Desktop (Electron)
+## Branches
 
-- `npm run dev:desktop`: abre o app desktop em modo dev (Vite + Electron).
-- `npm run desktop`: gera o build web e abre no Electron.
-- `npm run clean:release`: remove artefatos antigos de build (`release/` e `release-new/`).
-- `npm run dist:win`: limpa artefatos antigos e gera executavel Windows (`.exe`) portatil na pasta `release/`.
-
-No modo Electron, o atalho global do sistema `Numpad /` (tecla `/` do numpad) troca o design de forma aleatoria mesmo com o app em segundo plano.
+- `web`: versao web (Vite) para deploy.
+- `app`: versao desktop com Electron e build de executavel Windows.
 
 ## Build
 
@@ -50,6 +49,15 @@ No modo Electron, o atalho global do sistema `Numpad /` (tecla `/` do numpad) tr
 npm run build
 npm run preview
 ```
+
+## Deploy na Vercel
+
+1. Importe o repositório na Vercel.
+2. Em `Production Branch`, selecione `web`.
+3. Build command: `npm run build`.
+4. Output directory: `dist`.
+
+O arquivo `vercel.json` desta branch ja define essa configuracao.
 
 ## Estrutura
 
