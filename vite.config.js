@@ -24,6 +24,7 @@ export default defineConfig(async () => {
           legacy: resolve(__dirname, "legacy.html"),
           vue: resolve(__dirname, "vue.html"),
           vuePopup: resolve(__dirname, "vue-popup.html"),
+          vueMapperPopup: resolve(__dirname, "vue-mapper-popup.html"),
         },
       },
     },

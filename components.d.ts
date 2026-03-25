@@ -9,6 +9,9 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     KaleidosyncStage: typeof import('./src/components/KaleidosyncStage.vue')['default']
+    ProjectionFaceCanvas: typeof import('./src/components/ProjectionFaceCanvas.vue')['default']
+    ProjectionMapper: typeof import('./src/components/ProjectionMapper.vue')['default']
+    ProjectionMapperPanel: typeof import('./src/components/ProjectionMapperPanel.vue')['default']
     StageSketchMesh: typeof import('./src/components/StageSketchMesh.vue')['default']
   }
 }

@@ -13,6 +13,9 @@ export function useDesktopAudio() {
   const audioContext = ref(null);
   const analyserNode = ref(null);
   const sourceNode = ref(null);
+  const inputDevices = ref([]);
+  const selectedInputDeviceId = ref("");
+  const sourceMode = ref("desktop");
   const running = ref(false);
   const busy = ref(false);
   const status = ref("Conecte o audio do desktop para alimentar o visualizer.");
@@ -32,6 +35,31 @@ export function useDesktopAudio() {
 
   function isElectronRuntime() {
     return Boolean(window.bassReactorElectron?.isElectron);
+  }
+
+  function normalizeDeviceLabel(device, index) {
+    if (device?.label) return device.label;
+    return `Entrada ${index + 1}`;
+  }
+
+  async function refreshInputDevices() {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      inputDevices.value = devices
+        .filter((device) => device.kind === "audioinput")
+        .map((device, index) => ({
+          deviceId: device.deviceId,
+          label: normalizeDeviceLabel(device, index),
+        }));
+
+      if (!selectedInputDeviceId.value && inputDevices.value.length) {
+        selectedInputDeviceId.value = inputDevices.value[0].deviceId;
+      }
+    } catch {
+      inputDevices.value = [];
+    }
   }
 
   function stop(stopTracks = true) {
@@ -74,6 +102,48 @@ export function useDesktopAudio() {
     previousHighs = 0;
   }
 
+  async function connectStream(nextStream, nextMode = "desktop", successStatus = "Captura ativa.") {
+    const [audioTrack] = nextStream.getAudioTracks();
+    if (!audioTrack) {
+      nextStream.getTracks().forEach((track) => track.stop());
+      if (nextMode === "desktop") {
+        if (isElectronRuntime()) {
+          throw new Error("Nenhum audio do sistema foi capturado. Confirme se existe som sendo reproduzido na saida padrao do Windows.");
+        }
+        throw new Error("Nenhum audio foi compartilhado. Ative 'Compartilhar audio' na janela do navegador.");
+      }
+      throw new Error("Nenhum audio foi capturado da entrada selecionada.");
+    }
+
+    const ctx = new AudioContext();
+    await ctx.resume();
+
+    const nextAnalyser = ctx.createAnalyser();
+    nextAnalyser.fftSize = 1024;
+    nextAnalyser.smoothingTimeConstant = 0;
+
+    const nextSource = ctx.createMediaStreamSource(nextStream);
+    nextSource.connect(nextAnalyser);
+
+    streamHandle.value = nextStream;
+    audioContext.value = ctx;
+    analyserNode.value = nextAnalyser;
+    sourceNode.value = nextSource;
+    frequencyData = new Uint8Array(nextAnalyser.frequencyBinCount);
+    running.value = true;
+    sourceMode.value = nextMode;
+    status.value = successStatus;
+
+    nextStream.getTracks().forEach((track) => {
+      track.addEventListener("ended", () => {
+        stop(false);
+        status.value = "A captura foi encerrada.";
+      });
+    });
+
+    await refreshInputDevices();
+  }
+
   async function connectDesktop() {
     if (!navigator.mediaDevices?.getDisplayMedia) {
       error.value = true;
@@ -113,42 +183,50 @@ export function useDesktopAudio() {
           });
         }
       }
-
-      const [audioTrack] = nextStream.getAudioTracks();
-      if (!audioTrack) {
-        nextStream.getTracks().forEach((track) => track.stop());
-        if (isElectronRuntime()) {
-          throw new Error("Nenhum audio do sistema foi capturado. Confirme se existe som sendo reproduzido na saida padrao do Windows.");
-        }
-        throw new Error("Nenhum audio foi compartilhado. Ative 'Compartilhar audio' na janela do navegador.");
-      }
-
-      const ctx = new AudioContext();
-      await ctx.resume();
-
-      const nextAnalyser = ctx.createAnalyser();
-      nextAnalyser.fftSize = 1024;
-      nextAnalyser.smoothingTimeConstant = 0;
-
-      const nextSource = ctx.createMediaStreamSource(nextStream);
-      nextSource.connect(nextAnalyser);
-
-      streamHandle.value = nextStream;
-      audioContext.value = ctx;
-      analyserNode.value = nextAnalyser;
-      sourceNode.value = nextSource;
-      frequencyData = new Uint8Array(nextAnalyser.frequencyBinCount);
-      running.value = true;
-      status.value = "Captura ativa. O renderer Vue agora usa o stack visual do Kaleidosync com audio do desktop.";
-
-      nextStream.getTracks().forEach((track) => {
-        track.addEventListener("ended", () => {
-          stop(false);
-          status.value = "A captura foi encerrada.";
-        });
-      });
+      await connectStream(nextStream, "desktop", "Captura ativa. O renderer Vue agora usa o stack visual do Kaleidosync com audio do desktop.");
     } catch (caughtError) {
       const message = caughtError instanceof Error ? caughtError.message : "Falha ao iniciar a captura.";
+      stop(true);
+      error.value = true;
+      status.value = message;
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  async function connectInputDevice(deviceId = selectedInputDeviceId.value) {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      error.value = true;
+      status.value = "Este navegador nao suporta captura de entrada de audio.";
+      return;
+    }
+
+    busy.value = true;
+    error.value = false;
+    status.value = "Conectando entrada de audio...";
+
+    try {
+      stop(true);
+      const constraints = deviceId
+        ? {
+            audio: {
+              deviceId: { exact: deviceId },
+              autoGainControl: false,
+              echoCancellation: false,
+              noiseSuppression: false,
+            },
+            video: false,
+          }
+        : {
+            audio: true,
+            video: false,
+          };
+
+      const nextStream = await navigator.mediaDevices.getUserMedia(constraints);
+      selectedInputDeviceId.value = deviceId || "";
+      await connectStream(nextStream, "input", "Entrada de audio conectada para alimentar o visualizer.");
+    } catch (caughtError) {
+      const message = caughtError instanceof Error ? caughtError.message : "Falha ao conectar a entrada de audio.";
       stop(true);
       error.value = true;
       status.value = message;
@@ -217,6 +295,7 @@ export function useDesktopAudio() {
 
   if (typeof window !== "undefined") {
     rafId = window.requestAnimationFrame(tick);
+    refreshInputDevices();
   }
 
   onBeforeUnmount(() => {
@@ -236,7 +315,12 @@ export function useDesktopAudio() {
     busy,
     status,
     error,
+    inputDevices,
+    selectedInputDeviceId,
+    sourceMode,
     connectDesktop,
+    connectInputDevice,
+    refreshInputDevices,
     stop,
   };
 }

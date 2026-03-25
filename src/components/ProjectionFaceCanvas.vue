@@ -1,17 +1,16 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
-import ShaderScroll from "@wearesage/vue/components/webgl/ShaderScroll.vue";
-import { useSketches } from "@wearesage/vue/stores/sketches";
-import { useViewport } from "@wearesage/vue/stores/viewport";
-import { useUI } from "@wearesage/vue/stores/ui";
-import { useAnimation, useRAF } from "@wearesage/vue";
+import { computed, onBeforeUnmount, ref, shallowRef } from "vue";
+import { useAnimation } from "@wearesage/vue";
 import StageSketchMesh from "./StageSketchMesh.vue";
 
-const DESIGN_TRANSITION_MS = 900;
 const ASCII_STYLE_ID = "ascii-bw";
 const ASCII_CHARS = " .,:;irsXA253hMHGS#9B&@";
 
 const props = defineProps({
+  sketch: {
+    type: Object,
+    default: null,
+  },
   blink: {
     type: Number,
     default: 1,
@@ -20,37 +19,49 @@ const props = defineProps({
     type: Number,
     default: 0,
   },
-  colorIntensity: {
+  width: {
     type: Number,
-    default: 0,
+    default: 360,
+  },
+  height: {
+    type: Number,
+    default: 360,
   },
   visualStyle: {
     type: String,
     default: "default",
   },
+  flipX: {
+    type: Boolean,
+    default: false,
+  },
+  flipY: {
+    type: Boolean,
+    default: false,
+  },
+  cropTop: {
+    type: Number,
+    default: 0,
+  },
+  cropBottom: {
+    type: Number,
+    default: 1,
+  },
 });
 
-const emit = defineEmits(["select"]);
-
-const raf = useRAF();
-const sketches = useSketches();
-const viewport = useViewport();
-const ui = useUI();
 const context = shallowRef();
-const activeSketchMesh = shallowRef();
-const scroll = shallowRef();
-const activeRenderIndex = shallowRef(0);
+const mesh = shallowRef();
 const renderTime = ref(window.performance.now());
-const transitionStartAt = ref(0);
-const transitionProgress = ref(1);
 const asciiFrame = ref("");
-const asciiColumns = ref(0);
-const asciiRows = ref(0);
 let asciiCanvas = null;
 let asciiContext = null;
 let asciiMeasureCanvas = null;
 let asciiMeasureContext = null;
 let lastAsciiFrameAt = 0;
+
+function cloneValue(value) {
+  return JSON.parse(JSON.stringify(value));
+}
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
@@ -73,20 +84,17 @@ function ensureAsciiMeasureContext() {
 
 function measureAsciiCharWidth(fontSize) {
   ensureAsciiMeasureContext();
-  if (!asciiMeasureContext) {
-    return fontSize * 0.6;
-  }
+  if (!asciiMeasureContext) return fontSize * 0.6;
   asciiMeasureContext.font = `${fontSize}px Consolas, "Courier New", monospace`;
-  const metrics = asciiMeasureContext.measureText("M");
-  return metrics.width || fontSize * 0.6;
+  return asciiMeasureContext.measureText("M").width || fontSize * 0.6;
 }
 
 function getAsciiMetrics() {
   const lineHeight = 0.92;
-  const rows = clamp(Math.floor(height.value / 12), 36, 120);
-  const fontSize = clamp(height.value / (rows * lineHeight), 7, 16);
+  const rows = clamp(Math.floor(props.height / 12), 18, 60);
+  const fontSize = clamp(props.height / (rows * lineHeight), 5, 16);
   const charWidth = measureAsciiCharWidth(fontSize);
-  const columns = clamp(Math.floor(width.value / charWidth), 84, 320);
+  const columns = clamp(Math.floor(props.width / charWidth), 24, 96);
   return {
     columns,
     rows,
@@ -98,8 +106,6 @@ function getAsciiMetrics() {
 
 function resetAsciiFrame() {
   asciiFrame.value = "";
-  asciiColumns.value = 0;
-  asciiRows.value = 0;
   lastAsciiFrameAt = 0;
 }
 
@@ -132,7 +138,6 @@ function updateAsciiFrame(now) {
 
   for (let row = 0; row < metrics.rows; row += 1) {
     let line = "";
-
     for (let column = 0; column < metrics.columns; column += 1) {
       const offset = (row * metrics.columns + column) * 4;
       const alpha = data[offset + 3] / 255;
@@ -148,34 +153,15 @@ function updateAsciiFrame(now) {
       const charIndex = Math.round(luminance * (ASCII_CHARS.length - 1));
       line += ASCII_CHARS[charIndex];
     }
-
     lines.push(line);
   }
 
-  asciiColumns.value = metrics.columns;
-  asciiRows.value = metrics.rows;
   asciiFrame.value = lines.join("\n");
   lastAsciiFrameAt = now;
 }
+
 const visualStylePreset = computed(() => {
   switch (props.visualStyle) {
-    case "bw-jagged":
-      return {
-        dpr: 0.7,
-        grayscale: 1,
-        sepia: 0,
-        hueRotate: 0,
-        saturationBoost: 0,
-        brightnessBase: 0.92,
-        brightnessColorBoost: 0.34,
-        brightnessBlinkBoost: 0.18,
-        contrastBase: 1.36,
-        contrastColorBoost: 0.16,
-        colorAlphaBase: 0,
-        colorAlphaBoost: 0,
-        flashRgb: "255, 255, 255",
-        colorRgb: "255, 255, 255",
-      };
     case "ascii-bw":
       return {
         dpr: 0.55,
@@ -188,6 +174,23 @@ const visualStylePreset = computed(() => {
         brightnessBlinkBoost: 0.14,
         contrastBase: 1.48,
         contrastColorBoost: 0.18,
+        colorAlphaBase: 0,
+        colorAlphaBoost: 0,
+        flashRgb: "255, 255, 255",
+        colorRgb: "255, 255, 255",
+      };
+    case "bw-jagged":
+      return {
+        dpr: 0.7,
+        grayscale: 1,
+        sepia: 0,
+        hueRotate: 0,
+        saturationBoost: 0,
+        brightnessBase: 0.92,
+        brightnessColorBoost: 0.34,
+        brightnessBlinkBoost: 0.18,
+        contrastBase: 1.36,
+        contrastColorBoost: 0.16,
         colorAlphaBase: 0,
         colorAlphaBoost: 0,
         flashRgb: "255, 255, 255",
@@ -309,41 +312,39 @@ const visualStylePreset = computed(() => {
         contrastColorBoost: 0.16,
         colorAlphaBase: 0.06,
         colorAlphaBoost: 0.18,
-        flashRgb: "255, 255, 255",
+        flashRgb: "101, 224, 255",
         colorRgb: "101, 224, 255",
       };
   }
 });
 
-const width = computed(() => viewport.width);
-const height = computed(() => viewport.height);
-// dpr menor = mais pixelado e mais leve na GPU
-const dpr = computed(() => visualStylePreset.value.dpr);
-// Filtro global em cima do render final.
-// Mexa aqui para testar "look" rapido sem tocar no shader.
-const styles = computed(() => ({
-  width: `${width.value}px`,
-  height: `${height.value}px`,
+const faceUniforms = computed(() => cloneValue(props.sketch?.variants?.[0] || {}));
+const meshKey = computed(() => `${props.sketch?.id || "empty"}-${props.sketch?.shader?.length || 0}`);
+const faceDpr = computed(() => visualStylePreset.value.dpr);
+const faceStyle = computed(() => ({
   filter: [
-    `saturate(${(visualStylePreset.value.saturationBoost + props.colorIntensity * 1.85).toFixed(3)})`,
-    `brightness(${(visualStylePreset.value.brightnessBase + props.colorIntensity * visualStylePreset.value.brightnessColorBoost + props.blink * visualStylePreset.value.brightnessBlinkBoost).toFixed(3)})`,
-    `contrast(${(visualStylePreset.value.contrastBase + props.colorIntensity * visualStylePreset.value.contrastColorBoost).toFixed(3)})`,
+    `saturate(${(visualStylePreset.value.saturationBoost + props.blink * 0.2).toFixed(3)})`,
+    `brightness(${(visualStylePreset.value.brightnessBase + props.blink * visualStylePreset.value.brightnessBlinkBoost).toFixed(3)})`,
+    `contrast(${visualStylePreset.value.contrastBase.toFixed(3)})`,
     `grayscale(${visualStylePreset.value.grayscale.toFixed(3)})`,
     `sepia(${visualStylePreset.value.sepia.toFixed(3)})`,
     `hue-rotate(${visualStylePreset.value.hueRotate}deg)`,
   ].join(" "),
+  transform: `scale(${props.flipX ? -1 : 1}, ${props.flipY ? -1 : 1})`,
 }));
-const transitionActive = computed(() => transitionProgress.value < 1);
-const stageScale = computed(() => 1 + Math.sin(transitionProgress.value * Math.PI) * 0.018);
-const overlayOpacity = computed(() => {
-  const transitionGlow = transitionActive.value ? Math.sin(transitionProgress.value * Math.PI) * 0.22 : 0;
-  const liveFlash = Math.min(0.3, props.blink * (0.1 + props.colorIntensity * 0.16));
-  return transitionGlow + liveFlash;
+const viewportStyle = computed(() => {
+  const cropTop = clamp(Number(props.cropTop || 0), 0, 1);
+  const cropBottom = clamp(Number(props.cropBottom || 1), cropTop + 0.001, 1);
+  const cropHeight = cropBottom - cropTop;
+  return {
+    bottom: "auto",
+    top: `${((-cropTop / cropHeight) * 100).toFixed(4)}%`,
+    height: `${((1 / cropHeight) * 100).toFixed(4)}%`,
+  };
 });
 const overlayStyle = computed(() => ({
-  opacity: overlayOpacity.value.toFixed(3),
   "--flash-alpha": (0.08 + props.blink * 0.24).toFixed(3),
-  "--color-alpha": (visualStylePreset.value.colorAlphaBase + props.colorIntensity * visualStylePreset.value.colorAlphaBoost).toFixed(3),
+  "--color-alpha": (visualStylePreset.value.colorAlphaBase + props.blink * visualStylePreset.value.colorAlphaBoost).toFixed(3),
   "--flash-rgb": visualStylePreset.value.flashRgb,
   "--color-rgb": visualStylePreset.value.colorRgb,
 }));
@@ -352,196 +353,111 @@ const asciiStyle = computed(() => {
   return {
     fontSize: `${metrics.fontSize.toFixed(2)}px`,
     lineHeight: metrics.lineHeight.toFixed(2),
-    letterSpacing: `${metrics.letterSpacing.toFixed(2)}px`,
+    letterSpacing: `${metrics.letterSpacing}px`,
   };
 });
 
-function easeOutCubic(value) {
-  return 1 - Math.pow(1 - value, 3);
-}
-
-function resolveFrameTime(value) {
-  if (typeof value === "number" && Number.isFinite(value)) {
-    return value;
-  }
-  const fallback = Number(raf.time?.value);
-  if (Number.isFinite(fallback)) {
-    return fallback;
-  }
-  return window.performance.now();
-}
-
-function selectSketch(sketchValue) {
-  sketches.selectSketch(sketchValue);
-  ui.showShaderScroll = false;
-  emit("select", sketchValue);
-}
-
-watch(
-  () => sketches.shader,
-  (nextShader) => {
-    if (!nextShader) return;
-    if (transitionProgress.value === 1) {
-      activeRenderIndex.value += 1;
-    }
-    transitionStartAt.value = window.performance.now();
-    transitionProgress.value = 0;
-  },
-  { immediate: true }
-);
-
-watch(
-  () => sketches.uniformKeysSerialized,
-  () => {
-    if (!sketches.shader) return;
-    activeRenderIndex.value += 1;
-  },
-  { immediate: true }
-);
-
 useAnimation((now) => {
-  const frameNow = resolveFrameTime(now);
-  renderTime.value = frameNow;
+  renderTime.value = typeof now === "number" ? now : window.performance.now();
 
-  if (transitionStartAt.value) {
-    const elapsed = frameNow - transitionStartAt.value;
-    const linear = Math.min(1, elapsed / DESIGN_TRANSITION_MS);
-    transitionProgress.value = easeOutCubic(linear);
-    if (linear >= 1) {
-      transitionStartAt.value = 0;
-      transitionProgress.value = 1;
-    }
-  }
+  const renderer = context.value?.context?.renderer?.value;
+  const scene = context.value?.context?.scene?.value;
+  const camera = context.value?.context?.camera?.value;
+  if (!renderer || !scene || !camera) return;
 
-  if (!context.value?.context) {
-    return;
-  }
-  const { renderer, scene, camera } = context.value.context;
-  if (!renderer?.value || !scene?.value || !camera?.value) {
-    return;
-  }
-  activeSketchMesh.value?.update?.(frameNow);
-  scroll.value?.update?.(frameNow);
-  renderer.value.render(scene.value, camera.value);
-  updateAsciiFrame(frameNow);
-});
-
-function handleWheel(event) {
-  raf.preFrame.push(() => {
-    viewport.onScroll(event.deltaY);
-  });
-}
-
-onMounted(() => {
-  if (!sketches.sketch) {
-    sketches.sampleSketches();
-  }
-
-  document.body.addEventListener("wheel", handleWheel, { passive: true });
+  mesh.value?.update?.(renderTime.value);
+  renderer.render(scene, camera);
+  updateAsciiFrame(renderTime.value);
 });
 
 onBeforeUnmount(() => {
-  document.body.removeEventListener("wheel", handleWheel);
   resetAsciiFrame();
 });
 </script>
 
 <template>
-  <figure class="sage-renderer" :style="styles" :class="[{ show: ui.showShaderScroll }, `style-${props.visualStyle}`]">
-    <TresCanvas
-      :width="width"
-      :height="height"
-      :dpr="dpr"
-      class="sage-renderer__canvas"
-      render-mode="manual"
-      :antialias="false"
-      :alpha="false"
-      :premultiplied-alpha="false"
-      :preserve-drawing-buffer="false"
-      power-preference="high-performance"
-      ref="context"
-    >
-      <TresPerspectiveCamera :position="[0, 0, 1]" />
-
-      <StageSketchMesh
-        ref="activeSketchMesh"
-        :key="`active-${activeRenderIndex}`"
+  <div class="projection-face-canvas" :class="`style-${visualStyle}`" :style="faceStyle">
+    <div class="projection-face-canvas__viewport" :style="viewportStyle">
+      <TresCanvas
+        ref="context"
         :width="width"
         :height="height"
-        :dpr="dpr"
-        :shader="sketches.shader"
-        :uniforms="sketches.uniforms"
-        :volume="props.blink"
-        :stream="props.motion"
-        :time="renderTime"
-        :opacity="1"
-        :scale="stageScale"
-        :position="[0, 0, 0]"
-      />
+        :dpr="faceDpr"
+        class="projection-face-canvas__canvas"
+        render-mode="manual"
+        :antialias="false"
+        :alpha="false"
+        :premultiplied-alpha="false"
+        :preserve-drawing-buffer="false"
+        power-preference="high-performance"
+      >
+        <TresPerspectiveCamera :position="[0, 0, 1]" />
 
-      <ShaderScroll
-        ref="scroll"
-        @select="selectSketch"
-        :scrollY="viewport.scrollY"
-        :width="viewport.width"
-        :height="viewport.height"
-        :dpr="dpr"
-        :visible="ui.showShaderScroll"
-        :sketches="sketches.iterations"
-        :volume="props.blink"
-        :stream="props.motion"
-        :time="renderTime"
-      />
-    </TresCanvas>
-    <div class="sage-renderer__overlay" :style="overlayStyle"></div>
-    <div class="sage-renderer__fx"></div>
-    <pre v-if="props.visualStyle === ASCII_STYLE_ID" class="sage-renderer__ascii" :style="asciiStyle" aria-hidden="true">{{ asciiFrame }}</pre>
-  </figure>
+        <StageSketchMesh
+          ref="mesh"
+          :key="meshKey"
+          :width="width"
+          :height="height"
+          :dpr="faceDpr"
+          :shader="sketch?.shader || ''"
+          :uniforms="faceUniforms"
+          :volume="blink"
+          :stream="motion"
+          :time="renderTime"
+          :opacity="1"
+          :scale="1"
+          :position="[0, 0, 0]"
+        />
+      </TresCanvas>
+      <div class="projection-face-canvas__overlay" :style="overlayStyle"></div>
+      <div class="projection-face-canvas__fx"></div>
+      <pre v-if="visualStyle === ASCII_STYLE_ID" class="projection-face-canvas__ascii" :style="asciiStyle" aria-hidden="true">{{ asciiFrame }}</pre>
+    </div>
+  </div>
 </template>
 
 <style scoped>
-.sage-renderer {
-  position: fixed;
+.projection-face-canvas,
+.projection-face-canvas__viewport,
+.projection-face-canvas__canvas {
+  position: absolute;
   inset: 0;
-  z-index: 1;
-  margin: 0;
   width: 100%;
   height: 100%;
-  background: #02040a;
+  background: #000;
 }
 
-.sage-renderer__canvas {
-  width: 100%;
-  height: 100%;
-  background: #02040a;
+.projection-face-canvas {
+  overflow: hidden;
+  transform-origin: center;
 }
 
-.sage-renderer__overlay {
+.projection-face-canvas__viewport {
+  overflow: hidden;
+}
+
+.projection-face-canvas__overlay,
+.projection-face-canvas__fx,
+.projection-face-canvas__ascii {
   position: absolute;
   inset: 0;
   pointer-events: none;
+}
+
+.projection-face-canvas__overlay {
   background:
     radial-gradient(circle at 50% 50%, rgba(var(--flash-rgb, 255, 255, 255), var(--flash-alpha, 0.12)), transparent 42%),
     radial-gradient(circle at 50% 50%, rgba(var(--color-rgb, 101, 224, 255), var(--color-alpha, 0.08)), transparent 58%);
   mix-blend-mode: screen;
-  filter: blur(28px);
+  filter: blur(18px);
 }
 
-.sage-renderer__fx {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
+.projection-face-canvas__fx {
   opacity: 0;
 }
 
-.sage-renderer__ascii {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  width: 100%;
-  height: 100%;
+.projection-face-canvas__ascii {
   margin: 0;
-  padding: 0;
   overflow: hidden;
   color: #f6f6f6;
   white-space: pre;
@@ -549,21 +465,21 @@ onBeforeUnmount(() => {
   font-weight: 400;
   text-rendering: geometricPrecision;
   background: #000;
-  pointer-events: none;
 }
 
-.style-ascii-bw .sage-renderer__canvas,
-.style-ascii-bw .sage-renderer__overlay,
-.style-ascii-bw .sage-renderer__fx {
+.style-ascii-bw .projection-face-canvas__canvas,
+.style-ascii-bw .projection-face-canvas__overlay,
+.style-ascii-bw .projection-face-canvas__fx {
   opacity: 0;
 }
 
-.style-bw-jagged .sage-renderer__canvas {
+.style-bw-jagged .projection-face-canvas__canvas,
+.style-pixel-brutal .projection-face-canvas__canvas,
+.style-pixel-brutal-xl .projection-face-canvas__canvas {
   image-rendering: pixelated;
 }
 
-/* Scanline + textura crua */
-.style-bw-jagged .sage-renderer__fx {
+.style-bw-jagged .projection-face-canvas__fx {
   opacity: 0.52;
   mix-blend-mode: overlay;
   background:
@@ -571,8 +487,7 @@ onBeforeUnmount(() => {
     repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.08) 0 2px, rgba(0, 0, 0, 0.08) 2px 7px);
 }
 
-/* Reticula de impressao (CMYK fake) */
-.style-halftone-cmyk .sage-renderer__fx {
+.style-halftone-cmyk .projection-face-canvas__fx {
   opacity: 0.86;
   mix-blend-mode: multiply;
   filter: contrast(1.22) saturate(1.14);
@@ -583,12 +498,7 @@ onBeforeUnmount(() => {
     radial-gradient(circle at center, rgba(255, 255, 0, 0.22) 0 1.4px, transparent 1.58px) 1px 1.2px / 8px 8px;
 }
 
-.style-pixel-brutal .sage-renderer__canvas {
-  image-rendering: pixelated;
-}
-
-/* Grade dura + contraste para look "8-bit sujo" */
-.style-pixel-brutal .sage-renderer__fx {
+.style-pixel-brutal .projection-face-canvas__fx {
   opacity: 0.68;
   mix-blend-mode: hard-light;
   background:
@@ -596,12 +506,7 @@ onBeforeUnmount(() => {
     repeating-linear-gradient(90deg, rgba(0, 0, 0, 0.2) 0 2px, transparent 2px 6px);
 }
 
-.style-pixel-brutal-xl .sage-renderer__canvas {
-  image-rendering: pixelated;
-}
-
-/* Variante com blocos maiores e grade mais marcada */
-.style-pixel-brutal-xl .sage-renderer__fx {
+.style-pixel-brutal-xl .projection-face-canvas__fx {
   opacity: 0.82;
   mix-blend-mode: hard-light;
   background:
@@ -610,8 +515,7 @@ onBeforeUnmount(() => {
     linear-gradient(180deg, rgba(255, 196, 132, 0.06), rgba(24, 10, 0, 0.18));
 }
 
-/* CRT quente com scanline e vinheta */
-.style-crt-amber .sage-renderer__fx {
+.style-crt-amber .projection-face-canvas__fx {
   opacity: 0.74;
   mix-blend-mode: screen;
   background:
@@ -620,8 +524,7 @@ onBeforeUnmount(() => {
     linear-gradient(180deg, rgba(255, 201, 116, 0.06), rgba(28, 14, 4, 0.24));
 }
 
-/* Azul/ciano com cara de duotone frio */
-.style-duotone-ice .sage-renderer__fx {
+.style-duotone-ice .projection-face-canvas__fx {
   opacity: 0.64;
   mix-blend-mode: screen;
   background:
@@ -630,8 +533,7 @@ onBeforeUnmount(() => {
     radial-gradient(circle at 50% 45%, rgba(118, 228, 255, 0.16), transparent 55%);
 }
 
-/* Quente, estourado e com bloom falso */
-.style-infrared-bloom .sage-renderer__fx {
+.style-infrared-bloom .projection-face-canvas__fx {
   opacity: 0.7;
   mix-blend-mode: color-dodge;
   background:
