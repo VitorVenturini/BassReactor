@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useSketches } from "@wearesage/vue/stores/sketches";
 import { useUI } from "@wearesage/vue/stores/ui";
 import { useViewport } from "@wearesage/vue/stores/viewport";
@@ -11,11 +11,14 @@ import {
   DESIGN_51_ID,
   DESIGN_51_LAYOUT_VERSION,
   createDesign51Sketch,
-  ensureDesign51,
   getDesign51DefaultVariant,
 } from "./designs/design51.js";
 
 const PLAY_INTERVAL_MS = 30000;
+const DESIGN_SANDBOX_ENABLED = false;
+const BASE_DESIGN_TOTAL = 50;
+const PANIC_SESSION_STORAGE_KEY = "bass-reactor:panic-session-v1";
+const PANIC_AUDIO_RESTORE_DELAY_MS = 220;
 // Estilos "filtro" de tela inteira (pos-processo CSS).
 // Para criar/editar estilo visual, mexa em `src/components/KaleidosyncStage.vue`:
 // - computed `styles` (saturate/brightness/contrast/grayscale)
@@ -30,6 +33,17 @@ const VISUAL_STYLES = [
   { id: "crt-amber", label: "CRT Ambar" },
   { id: "duotone-ice", label: "Duotone Ice" },
   { id: "infrared-bloom", label: "Infra Bloom" },
+];
+const STYLE_CYCLE_IDS = ["default", "pixel-brutal", "bw-jagged", "crt-amber"];
+const AUDIO_CAPTURE_TABS = [
+  { id: "desktop", label: "Sistema" },
+  { id: "application", label: "Aplicativo" },
+  { id: "microphone", label: "Microfone" },
+];
+const QUALITY_MODES = [
+  { id: "performance", label: "Alta perf" },
+  { id: "balanced", label: "Medio" },
+  { id: "beautiful", label: "Bonito" },
 ];
 const DESIGN_FAMILIES = {
   // Familia citada por voce para "efeito kaleido".
@@ -55,13 +69,16 @@ const audio = useDesktopAudio();
 const sketches = useSketches();
 const ui = useUI();
 const viewport = useViewport();
-ensureDesign51(sketches);
 
 const uiHidden = ref(false);
+const performanceHudOpen = ref(false);
 const playMode = ref(false);
 const playCountdown = ref(30);
 const visualStyle = ref("default");
-const audioInputPickerOpen = ref(false);
+const qualityMode = ref("balanced");
+const lastNonAsciiVisualStyle = ref("default");
+const audioModalOpen = ref(false);
+const audioCaptureTab = ref("desktop");
 const projectionMapperOpen = ref(false);
 const projectionMapperInstanceKey = ref(0);
 const projectionMapperRef = ref(null);
@@ -82,8 +99,9 @@ let playTimer = 0;
 let playCountdownTimer = 0;
 let nextPlayAt = 0;
 let unsubscribeElectronShortcut = null;
-let autoConnectTriggered = false;
 let mapperPopupChannel = null;
+let lastHandledVisualShortcut = { family: "", at: 0 };
+let panicReloadInFlight = false;
 
 function cloneValue(value) {
   return JSON.parse(JSON.stringify(value));
@@ -95,6 +113,19 @@ function createProjectionMapperEmptyState() {
     selectedFaceId: null,
     faceOptions: [],
   };
+}
+
+function normalizeProjectionMapperState(value) {
+  return {
+    faces: Array.isArray(value?.faces) ? cloneValue(value.faces) : [],
+    selectedFaceId: value?.selectedFaceId ?? null,
+    faceOptions: Array.isArray(value?.faceOptions) ? cloneValue(value.faceOptions) : [],
+  };
+}
+
+function getProjectionMapperStateSnapshot() {
+  const liveSnapshot = projectionMapperRef.value?.getStateSnapshot?.();
+  return normalizeProjectionMapperState(liveSnapshot || projectionMapperState.value || createProjectionMapperEmptyState());
 }
 
 const sketchOptions = computed(() =>
@@ -124,13 +155,236 @@ function resolveSketchIndex(sketchValue) {
   return iterations.findIndex((item) => item?.shader === shader);
 }
 
+function buildPanicSessionSnapshot() {
+  const variantIndex = Number(sketches.variant);
+
+  return {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    visualStyle: visualStyle.value,
+    qualityMode: qualityMode.value,
+    lastNonAsciiVisualStyle: lastNonAsciiVisualStyle.value,
+    uiHidden: uiHidden.value,
+    performanceHudOpen: performanceHudOpen.value,
+    playMode: playMode.value,
+    audioCaptureTab: audioCaptureTab.value,
+    projectionMapperOpen: projectionMapperOpen.value,
+    projectionMapperState: getProjectionMapperStateSnapshot(),
+    design51EditorOpen: design51EditorOpen.value,
+    designInspectorOpen: designInspectorOpen.value,
+    shaderScrollOpen: Boolean(ui.showShaderScroll),
+    currentSketchIndex: currentSketchIndex.value,
+    sketches: {
+      iterations: Array.isArray(sketches.iterations) ? cloneValue(sketches.iterations) : [],
+      sketch: cloneValue(sketches.sketch || null),
+      shader: typeof sketches.shader === "string" ? sketches.shader : "",
+      uniforms: cloneValue(sketches.uniforms || {}),
+      variant: Number.isInteger(variantIndex) && variantIndex >= 0 ? variantIndex : 0,
+    },
+    audio: {
+      sourceMode: String(audio.sourceMode.value || "desktop"),
+      selectedDesktopSourceId: String(audio.selectedDesktopSourceId.value || ""),
+      selectedInputDeviceId: String(audio.selectedInputDeviceId.value || ""),
+      running: Boolean(audio.running.value),
+    },
+  };
+}
+
+function savePanicSessionSnapshot() {
+  try {
+    localStorage.setItem(PANIC_SESSION_STORAGE_KEY, JSON.stringify(buildPanicSessionSnapshot()));
+    return true;
+  } catch (error) {
+    console.warn("[BassReactor] Nao foi possivel salvar o snapshot de emergencia.", error);
+    return false;
+  }
+}
+
+function restoreSketchSession(snapshot) {
+  const sketchSession = snapshot?.sketches;
+  if (!sketchSession || typeof sketchSession !== "object") return;
+
+  if (Array.isArray(sketchSession.iterations) && sketchSession.iterations.length) {
+    sketches.iterations = cloneValue(sketchSession.iterations);
+  }
+
+  const requestedIndex = Number(snapshot?.currentSketchIndex);
+  const hasIndex = Number.isInteger(requestedIndex) && requestedIndex >= 0 && requestedIndex < (sketches.iterations?.length || 0);
+
+  if (hasIndex) {
+    sketches.selectSketch(cloneValue(sketches.iterations[requestedIndex]), "panic-restore");
+  } else if (sketchSession.sketch) {
+    sketches.selectSketch(cloneValue(sketchSession.sketch), "panic-restore");
+  }
+
+  if (typeof sketchSession.shader === "string") {
+    sketches.shader = sketchSession.shader;
+  }
+
+  if (sketchSession.uniforms && typeof sketchSession.uniforms === "object" && !Array.isArray(sketchSession.uniforms)) {
+    sketches.uniforms = cloneValue(sketchSession.uniforms);
+  }
+
+  const variantIndex = Number(sketchSession.variant);
+  if (Number.isInteger(variantIndex) && variantIndex >= 0) {
+    sketches.variant = variantIndex;
+  }
+}
+
+async function restoreAudioSession(snapshot) {
+  const audioSession = snapshot?.audio;
+  if (!audioSession || typeof audioSession !== "object") return;
+
+  audio.selectedDesktopSourceId.value = String(audioSession.selectedDesktopSourceId || "");
+  audio.selectedInputDeviceId.value = String(audioSession.selectedInputDeviceId || "");
+
+  if (!audioSession.running) return;
+
+  if (!isElectronRuntime()) {
+    audio.status.value = "Sessao restaurada. Reconecte o audio se necessario.";
+    return;
+  }
+
+  if (String(audioSession.sourceMode || "desktop") === "input") {
+    await audio.connectInputDevice(audio.selectedInputDeviceId.value);
+    return;
+  }
+
+  await audio.connectDesktop(audio.selectedDesktopSourceId.value);
+}
+
+function queueProjectionMapperHydration() {
+  nextTick(() => {
+    projectionMapperRef.value?.applySnapshot?.(projectionMapperState.value);
+    syncMapperPopupState();
+  });
+}
+
+async function restorePanicSessionSnapshot() {
+  let rawSnapshot = "";
+
+  try {
+    rawSnapshot = localStorage.getItem(PANIC_SESSION_STORAGE_KEY) || "";
+  } catch {
+    return;
+  }
+
+  if (!rawSnapshot) return;
+
+  let snapshot = null;
+  try {
+    snapshot = JSON.parse(rawSnapshot);
+  } catch (error) {
+    console.warn("[BassReactor] Snapshot de emergencia invalido, ignorando.", error);
+    localStorage.removeItem(PANIC_SESSION_STORAGE_KEY);
+    return;
+  }
+
+  if (!snapshot || snapshot.version !== 1) {
+    localStorage.removeItem(PANIC_SESSION_STORAGE_KEY);
+    return;
+  }
+
+  restoreSketchSession(snapshot);
+
+  if (VISUAL_STYLES.some((style) => style.id === snapshot.visualStyle)) {
+    setVisualStyle(snapshot.visualStyle);
+  }
+  if (QUALITY_MODES.some((mode) => mode.id === snapshot.qualityMode)) {
+    setQualityMode(snapshot.qualityMode);
+  }
+  if (VISUAL_STYLES.some((style) => style.id === snapshot.lastNonAsciiVisualStyle)) {
+    lastNonAsciiVisualStyle.value = snapshot.lastNonAsciiVisualStyle;
+  }
+
+  uiHidden.value = Boolean(snapshot.uiHidden);
+  performanceHudOpen.value = Boolean(snapshot.performanceHudOpen);
+  audioCaptureTab.value = AUDIO_CAPTURE_TABS.some((tab) => tab.id === snapshot.audioCaptureTab) ? snapshot.audioCaptureTab : "desktop";
+  projectionMapperState.value = normalizeProjectionMapperState(snapshot.projectionMapperState);
+  design51EditorOpen.value = Boolean(snapshot.design51EditorOpen);
+  designInspectorOpen.value = Boolean(snapshot.designInspectorOpen);
+  ui.showShaderScroll = Boolean(snapshot.shaderScrollOpen) && !Boolean(snapshot.projectionMapperOpen);
+
+  if (snapshot.playMode) {
+    startPlayMode();
+  } else {
+    stopPlayMode();
+  }
+
+  if (snapshot.projectionMapperOpen) {
+    setWorkspaceMode("mapper");
+  } else {
+    projectionMapperOpen.value = false;
+    projectionMapperPopupReady.value = false;
+  }
+
+  window.setTimeout(() => {
+    restoreAudioSession(snapshot).catch((error) => {
+      console.warn("[BassReactor] Falha ao restaurar o audio apos o panic reload.", error);
+    });
+  }, PANIC_AUDIO_RESTORE_DELAY_MS);
+
+  localStorage.removeItem(PANIC_SESSION_STORAGE_KEY);
+}
+
+function triggerPanicReload() {
+  if (panicReloadInFlight) return;
+  panicReloadInFlight = true;
+  projectionMapperState.value = getProjectionMapperStateSnapshot();
+  savePanicSessionSnapshot();
+
+  if (window.bassReactorElectron?.reloadAllWindows) {
+    window.bassReactorElectron.reloadAllWindows();
+    return;
+  }
+
+  window.location.reload();
+}
+
+function disableSandboxDesigns() {
+  const iterations = sketches.iterations || [];
+  if (!Array.isArray(iterations) || !iterations.length) return;
+
+  if (iterations.length > BASE_DESIGN_TOTAL) {
+    iterations.splice(BASE_DESIGN_TOTAL);
+  }
+
+  if (sketches.sketch && resolveSketchIndex(sketches.sketch) >= BASE_DESIGN_TOTAL) {
+    const fallbackSketch = iterations[0] || null;
+    if (fallbackSketch) {
+      sketches.selectSketch(cloneValue(fallbackSketch), "internal");
+    }
+  }
+
+  design51EditorOpen.value = false;
+}
+
 const currentSketchIndex = computed(() => {
   return resolveSketchIndex(sketches.sketch);
 });
 const currentSketch = computed(() => sketches.sketch || null);
-const isDesign51Active = computed(() => sketches.sketch?.id === DESIGN_51_ID);
+const isDesign51Active = computed(() => DESIGN_SANDBOX_ENABLED && sketches.sketch?.id === DESIGN_51_ID);
 const design51EditorVisible = computed(() => isDesign51Active.value && design51EditorOpen.value && !projectionMapperOpen.value && !uiHidden.value && !ui.showShaderScroll);
 const designInspectorVisible = computed(() => designInspectorOpen.value && !projectionMapperOpen.value && !uiHidden.value && !ui.showShaderScroll);
+const currentAudioSourceLabel = computed(() => {
+  if (audio.sourceMode.value === "input") {
+    return "Microfone";
+  }
+  if (audio.sourceMode.value === "application") {
+    return "Aplicativo";
+  }
+  return "Sistema";
+});
+const activeDesktopSourceLabel = computed(() => {
+  const source = audio.desktopSources.value.find((entry) => entry.id === audio.selectedDesktopSourceId.value);
+  return source?.label || "Selecionar aplicativo";
+});
+const qualityModeLabel = computed(() => {
+  return QUALITY_MODES.find((mode) => mode.id === qualityMode.value)?.label || "Medio";
+});
+const visualStyleLabel = computed(() => {
+  return VISUAL_STYLES.find((style) => style.id === visualStyle.value)?.label || "Original";
+});
 const baseDesignOptions = computed(() =>
   (sketches.iterations || []).slice(0, 50).map((item, index) => ({
     index,
@@ -154,11 +408,48 @@ const sketchName = computed(() => {
   if (option.label === option.code) return option.code;
   return `${option.code} - ${option.label}`;
 });
+const playStatusLabel = computed(() => (playMode.value ? `Auto ${playCountdown.value}s` : "Manual"));
+
+watch(
+  visualStyle,
+  (nextStyle) => {
+    if (!VISUAL_STYLES.some((style) => style.id === nextStyle)) {
+      visualStyle.value = "default";
+      return;
+    }
+    if (nextStyle !== "ascii-bw") {
+      lastNonAsciiVisualStyle.value = nextStyle;
+    }
+  },
+  { immediate: true }
+);
+
+watch(
+  audioCaptureTab,
+  (nextTab) => {
+    if (nextTab === "microphone") {
+      audio.refreshInputDevices();
+      return;
+    }
+    audio.refreshDesktopSources();
+  },
+  { immediate: true }
+);
 
 watch(
   isDesign51Active,
   (active) => {
     design51EditorOpen.value = active;
+  },
+  { immediate: true }
+);
+
+watch(
+  () => sketches.iterations?.length,
+  () => {
+    if (!DESIGN_SANDBOX_ENABLED) {
+      disableSandboxDesigns();
+    }
   },
   { immediate: true }
 );
@@ -471,6 +762,7 @@ function downloadCurrentSketchJson() {
 }
 
 function cloneCurrentSketchTo51() {
+  if (!DESIGN_SANDBOX_ENABLED) return;
   if (!currentSketch.value || currentSketch.value.id === DESIGN_51_ID) return;
   setDesign51Sketch(currentSketch.value, currentSketchIndex.value >= 0 && currentSketchIndex.value < 50 ? currentSketchIndex.value : null);
   sketches.selectSketchByIndex(50, "pointer");
@@ -567,6 +859,7 @@ function formatDesign51FieldValue(field) {
 }
 
 function toggleDesign51Editor() {
+  if (!DESIGN_SANDBOX_ENABLED) return;
   if (!isDesign51Active.value) return;
   if (projectionMapperOpen.value) {
     closeProjectionMapper();
@@ -590,33 +883,67 @@ function closeProjectionMapper() {
 
 function setWorkspaceMode(mode) {
   const shouldOpenMapper = String(mode || "visualizer") === "mapper";
-  if (projectionMapperOpen.value === shouldOpenMapper) return;
+  if (projectionMapperOpen.value === shouldOpenMapper) {
+    if (shouldOpenMapper) {
+      queueProjectionMapperHydration();
+    }
+    return;
+  }
+
+  if (!shouldOpenMapper) {
+    projectionMapperState.value = getProjectionMapperStateSnapshot();
+  }
+
   projectionMapperOpen.value = shouldOpenMapper;
   if (projectionMapperOpen.value) {
     design51EditorOpen.value = false;
     designInspectorOpen.value = false;
     ui.showShaderScroll = false;
+    queueProjectionMapperHydration();
     openProjectionMapperPopup();
     return;
   }
   projectionMapperPopupReady.value = false;
   closeProjectionMapperPopup();
-  projectionMapperState.value = createProjectionMapperEmptyState();
 }
 
-function toggleAudioInputPicker() {
-  audioInputPickerOpen.value = !audioInputPickerOpen.value;
-  if (audioInputPickerOpen.value) {
+function setAudioCaptureTab(mode) {
+  const nextMode = String(mode || "desktop");
+  if (!AUDIO_CAPTURE_TABS.some((tab) => tab.id === nextMode)) return;
+  audioCaptureTab.value = nextMode;
+}
+
+function openAudioModal() {
+  audioModalOpen.value = true;
+  if (audioCaptureTab.value === "microphone") {
     audio.refreshInputDevices();
+    return;
   }
+  audio.refreshDesktopSources();
+}
+
+function closeAudioModal() {
+  audioModalOpen.value = false;
 }
 
 function handleAudioInputDeviceChange(event) {
   audio.selectedInputDeviceId.value = String(event.target.value || "");
 }
 
+function handleDesktopSourceChange(event) {
+  audio.selectedDesktopSourceId.value = String(event.target.value || "");
+}
+
 function connectSelectedAudioInput() {
   audio.connectInputDevice(audio.selectedInputDeviceId.value);
+}
+
+function connectDesktopSystemAudio() {
+  audio.connectDesktop();
+}
+
+function connectSelectedDesktopSource() {
+  audio.connectDesktop(audio.selectedDesktopSourceId.value);
 }
 
 function ensureMapperPopupChannel() {
@@ -635,6 +962,10 @@ function ensureMapperPopupChannel() {
       return;
     }
     if (message.type === "mapper-command") {
+      if (message.payload?.type === "panic-reload") {
+        triggerPanicReload();
+        return;
+      }
       projectionMapperRef.value?.applyCommand?.(message.payload || {});
     }
   };
@@ -644,12 +975,12 @@ function syncMapperPopupState() {
   if (!mapperPopupChannel || !projectionMapperPopupReady.value) return;
   mapperPopupChannel.postMessage({
     type: "mapper-state-sync",
-    payload: cloneValue(projectionMapperState.value),
+    payload: getProjectionMapperStateSnapshot(),
   });
 }
 
 function handleProjectionMapperStateChange(nextState) {
-  projectionMapperState.value = cloneValue(nextState || createProjectionMapperEmptyState());
+  projectionMapperState.value = normalizeProjectionMapperState(nextState || createProjectionMapperEmptyState());
   syncMapperPopupState();
 }
 
@@ -677,6 +1008,7 @@ function openProjectionMapperPopup() {
 }
 
 function closeProjectionMapperPopup() {
+  projectionMapperPopupReady.value = false;
   if (window.bassReactorElectron?.closeMapperPopup) {
     window.bassReactorElectron.closeMapperPopup();
   }
@@ -798,13 +1130,6 @@ function isElectronRuntime() {
   return Boolean(window.bassReactorElectron?.isElectron);
 }
 
-function tryAutoConnectAudio() {
-  if (autoConnectTriggered) return;
-  autoConnectTriggered = true;
-  if (audio.running.value || audio.busy.value) return;
-  audio.connectDesktop();
-}
-
 function syncPlayCountdown() {
   if (!playMode.value || !nextPlayAt) {
     playCountdown.value = 30;
@@ -829,9 +1154,27 @@ function schedulePlayCycle() {
   }, PLAY_INTERVAL_MS);
 }
 
-function togglePlayMode() {
-  playMode.value = !playMode.value;
+function startPlayMode() {
+  if (playMode.value) {
+    schedulePlayCycle();
+    return;
+  }
+  playMode.value = true;
   schedulePlayCycle();
+}
+
+function stopPlayMode() {
+  if (!playMode.value) return;
+  playMode.value = false;
+  schedulePlayCycle();
+}
+
+function togglePlayMode() {
+  if (playMode.value) {
+    stopPlayMode();
+    return;
+  }
+  startPlayMode();
 }
 
 function toggleUiHidden() {
@@ -839,6 +1182,27 @@ function toggleUiHidden() {
   if (uiHidden.value) {
     ui.showShaderScroll = false;
   }
+}
+
+function togglePerformanceHud() {
+  performanceHudOpen.value = !performanceHudOpen.value;
+}
+
+function setQualityMode(nextMode) {
+  const normalizedMode = String(nextMode || "balanced");
+  if (!QUALITY_MODES.some((mode) => mode.id === normalizedMode)) return;
+  qualityMode.value = normalizedMode;
+}
+
+function cycleQualityMode(direction = 1) {
+  const currentIndex = QUALITY_MODES.findIndex((mode) => mode.id === qualityMode.value);
+  const safeIndex = currentIndex === -1 ? 1 : currentIndex;
+  const nextIndex = (safeIndex + direction + QUALITY_MODES.length) % QUALITY_MODES.length;
+  setQualityMode(QUALITY_MODES[nextIndex].id);
+}
+
+function forcePerformanceMode() {
+  setQualityMode("performance");
 }
 
 function toggleDesigns() {
@@ -929,6 +1293,13 @@ function handleVisualShortcutPayload(payload, source = "global-shortcut") {
   const familyRaw = String(payload?.family || "random");
   const family = familyRaw.toLowerCase();
 
+  if (family === "quality-performance" || family === "performance-mode" || family === "safe-performance") {
+    forcePerformanceMode();
+    return;
+  }
+  if (handleVisualStyleShortcutPayload(family)) {
+    return;
+  }
   if (family === "next" || family === "next-order" || family === "next-sketch") {
     nextSketch();
     return;
@@ -975,15 +1346,122 @@ function handleVisualShortcutPayload(payload, source = "global-shortcut") {
   randomSketch(source);
 }
 
-function selectSketchByIndex(event) {
-  const nextIndex = Number(event.target.value);
-  selectSketchAtIndex(nextIndex, "pointer");
+function setVisualStyle(nextStyle) {
+  const normalizedStyle = String(nextStyle || "default");
+  if (!VISUAL_STYLES.some((style) => style.id === normalizedStyle)) return;
+  if (normalizedStyle !== "ascii-bw") {
+    lastNonAsciiVisualStyle.value = normalizedStyle;
+  }
+  visualStyle.value = normalizedStyle;
 }
 
-function selectVisualStyle(event) {
-  const nextStyle = String(event.target.value || "default");
-  if (!VISUAL_STYLES.some((style) => style.id === nextStyle)) return;
-  visualStyle.value = nextStyle;
+function cycleVisualStyle(direction = 1) {
+  const currentIndex = STYLE_CYCLE_IDS.indexOf(visualStyle.value);
+  if (currentIndex === -1) {
+    const fallbackStyle = direction >= 0 ? STYLE_CYCLE_IDS[0] : STYLE_CYCLE_IDS[STYLE_CYCLE_IDS.length - 1];
+    setVisualStyle(fallbackStyle);
+    return;
+  }
+
+  const nextIndex = (currentIndex + direction + STYLE_CYCLE_IDS.length) % STYLE_CYCLE_IDS.length;
+  setVisualStyle(STYLE_CYCLE_IDS[nextIndex]);
+}
+
+function toggleAsciiStyle() {
+  if (visualStyle.value === "ascii-bw") {
+    setVisualStyle(lastNonAsciiVisualStyle.value || STYLE_CYCLE_IDS[0] || "default");
+    return;
+  }
+  visualStyle.value = "ascii-bw";
+}
+
+function isAsciiStyleShortcut(event) {
+  return event.altKey && event.shiftKey && !event.ctrlKey && !event.metaKey && event.key.toLowerCase() === "e";
+}
+
+function isStyleCycleShortcut(event, direction) {
+  if (!event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return false;
+  if (direction > 0) return event.key === "ArrowDown";
+  return event.key === "ArrowUp";
+}
+
+function getCanonicalVisualShortcutFamily(family) {
+  const normalizedFamily = String(family || "").toLowerCase();
+  if (normalizedFamily === "style-prev" || normalizedFamily === "visual-style-prev") return "style-prev";
+  if (normalizedFamily === "style-next" || normalizedFamily === "visual-style-next") return "style-next";
+  if (normalizedFamily === "style-ascii" || normalizedFamily === "ascii" || normalizedFamily === "ascii-bw") {
+    return "style-ascii";
+  }
+  return "";
+}
+
+function markVisualShortcutHandled(family) {
+  const canonicalFamily = getCanonicalVisualShortcutFamily(family);
+  if (!canonicalFamily) return;
+  lastHandledVisualShortcut = { family: canonicalFamily, at: Date.now() };
+}
+
+function shouldIgnoreDuplicateVisualShortcut(family) {
+  const canonicalFamily = getCanonicalVisualShortcutFamily(family);
+  if (!canonicalFamily) return false;
+  return (
+    lastHandledVisualShortcut.family === canonicalFamily &&
+    Date.now() - lastHandledVisualShortcut.at < 220
+  );
+}
+
+function isQualityCycleShortcut(event, direction) {
+  if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return false;
+  if (direction > 0) return event.key === "End";
+  return event.key === "Home";
+}
+
+function handleVisualStyleShortcutPayload(family) {
+  const canonicalFamily = getCanonicalVisualShortcutFamily(family);
+  if (shouldIgnoreDuplicateVisualShortcut(canonicalFamily)) {
+    return true;
+  }
+  if (canonicalFamily === "style-prev") {
+    markVisualShortcutHandled(canonicalFamily);
+    cycleVisualStyle(-1);
+    return true;
+  }
+  if (canonicalFamily === "style-next") {
+    markVisualShortcutHandled(canonicalFamily);
+    cycleVisualStyle(1);
+    return true;
+  }
+  if (canonicalFamily === "style-ascii") {
+    markVisualShortcutHandled(canonicalFamily);
+    toggleAsciiStyle();
+    return true;
+  }
+  return false;
+}
+
+function handleLocalVisualStyleShortcuts(event) {
+  if (isAsciiStyleShortcut(event)) {
+    event.preventDefault();
+    if (shouldIgnoreDuplicateVisualShortcut("style-ascii")) return true;
+    markVisualShortcutHandled("style-ascii");
+    toggleAsciiStyle();
+    return true;
+  }
+  if (isStyleCycleShortcut(event, -1)) {
+    event.preventDefault();
+    if (shouldIgnoreDuplicateVisualShortcut("style-prev")) return true;
+    markVisualShortcutHandled("style-prev");
+    cycleVisualStyle(-1);
+    return true;
+  }
+  if (isStyleCycleShortcut(event, 1)) {
+    event.preventDefault();
+    if (shouldIgnoreDuplicateVisualShortcut("style-next")) return true;
+    markVisualShortcutHandled("style-next");
+    cycleVisualStyle(1);
+    return true;
+  }
+  return false;
 }
 
 function handleKeydown(event) {
@@ -993,6 +1471,16 @@ function handleKeydown(event) {
     target instanceof HTMLTextAreaElement ||
     target instanceof HTMLSelectElement ||
     target?.isContentEditable;
+
+  if (event.altKey && !event.ctrlKey && !event.metaKey && event.key === "Enter") {
+    event.preventDefault();
+    forcePerformanceMode();
+    return;
+  }
+
+  if (!editable && handleLocalVisualStyleShortcuts(event)) {
+    return;
+  }
 
   // Em desktop (Electron) os Alt+letra sao globais via main.mjs.
   // Em web, mantemos fallback local.
@@ -1054,11 +1542,26 @@ function handleKeydown(event) {
     toggleDesignInspector();
     return;
   }
-  if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+  if (!editable && event.key.toLowerCase() === "u") {
+    event.preventDefault();
+    toggleUiHidden();
+    return;
+  }
+  if (!editable && isQualityCycleShortcut(event, -1)) {
+    event.preventDefault();
+    cycleQualityMode(-1);
+    return;
+  }
+  if (!editable && isQualityCycleShortcut(event, 1)) {
+    event.preventDefault();
+    cycleQualityMode(1);
+    return;
+  }
+  if (!event.ctrlKey && !event.altKey && !event.metaKey && (event.key === "ArrowRight" || event.key === "ArrowDown")) {
     event.preventDefault();
     nextSketch();
   }
-  if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+  if (!event.ctrlKey && !event.altKey && !event.metaKey && (event.key === "ArrowLeft" || event.key === "ArrowUp")) {
     event.preventDefault();
     previousSketch();
   }
@@ -1078,9 +1581,21 @@ function handleKeydown(event) {
     event.preventDefault();
     togglePlayMode();
   }
+  if (!editable && event.key.toLowerCase() === "p") {
+    event.preventDefault();
+    togglePerformanceHud();
+  }
+  if (!editable && !event.repeat && !event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === "r") {
+    event.preventDefault();
+    triggerPanicReload();
+    return;
+  }
   if (event.key === "Escape") {
     ui.showShaderScroll = false;
     uiHidden.value = false;
+    if (audioModalOpen.value) {
+      closeAudioModal();
+    }
     if (design51EditorOpen.value) {
       design51EditorOpen.value = false;
     }
@@ -1105,11 +1620,10 @@ onMounted(() => {
     });
   }
 
-  if (isElectronRuntime()) {
-    window.setTimeout(tryAutoConnectAudio, 280);
-  }
-
   window.addEventListener("keydown", handleKeydown);
+  restorePanicSessionSnapshot().catch((error) => {
+    console.warn("[BassReactor] Falha ao restaurar o panic snapshot.", error);
+  });
 });
 
 onBeforeUnmount(() => {
@@ -1135,6 +1649,8 @@ onBeforeUnmount(() => {
       :motion="audio.motionStream.value"
       :color-intensity="audio.colorIntensity.value"
       :visual-style="visualStyle"
+      :quality-mode="qualityMode"
+      :show-performance-hud="performanceHudOpen"
     />
     <ProjectionMapper
       v-else
@@ -1151,107 +1667,164 @@ onBeforeUnmount(() => {
     <aside class="ks-panel ks-panel--compact" :class="{ 'is-hidden': uiHidden || ui.showShaderScroll }">
       <div class="ks-panel__top">
         <div>
-          <p class="eyebrow">Kaleidosync Mode</p>
+          <p class="eyebrow">Bass Reactor</p>
           <h1>Kaleido Reactor</h1>
+          <p class="hint">U esconde a UI. Home e End alternam a qualidade. Alt + Enter forca alta performance. P abre o painel de performance. R salva e recarrega tudo.</p>
         </div>
-        <button class="ghost" @click="toggleUiHidden">Hide UI</button>
-      </div>
-
-      <p class="hint">Modo desktop com captura automatica do audio do sistema e popup separado para o mapper.</p>
-
-      <nav class="ks-mode-tabs" aria-label="Modo da tela">
-        <button class="ks-mode-tabs__tab" :class="{ 'is-active': !projectionMapperOpen }" @click="setWorkspaceMode('visualizer')">
-          Visualizacoes
-        </button>
-        <button class="ks-mode-tabs__tab" :class="{ 'is-active': projectionMapperOpen }" @click="setWorkspaceMode('mapper')">
-          Mapper
-        </button>
-      </nav>
-
-      <div class="ks-actions">
-        <button @click="toggleAudioInputPicker">{{ audioInputPickerOpen ? "Fechar entradas" : "Entradas de audio" }}</button>
-        <button v-if="isDesign51Active" :class="{ 'is-active': design51EditorOpen }" @click="toggleDesign51Editor">Editor 51</button>
-        <button :class="{ 'is-active': playMode }" @click="togglePlayMode">
-          {{ playMode ? `Play ${playCountdown}s` : "Play" }}
-        </button>
-        <button @click="previousSketch">Anterior</button>
-        <button @click="nextSketch">Proximo</button>
-        <button @click="viewport.toggleFullscreen">Fullscreen</button>
-        <button @click="audio.stop" :disabled="!audio.running.value">Parar</button>
-      </div>
-
-      <label v-if="audioInputPickerOpen" class="ks-select">
-        <span>Entrada manual do PC</span>
-        <select :value="audio.selectedInputDeviceId.value" @change="handleAudioInputDeviceChange">
-          <option v-for="device in audio.inputDevices.value" :key="device.deviceId" :value="device.deviceId">
-            {{ device.label }}
-          </option>
-        </select>
-      </label>
-      <div v-if="audioInputPickerOpen" class="ks-actions">
-        <button class="ghost" @click="connectSelectedAudioInput" :disabled="audio.busy.value || !audio.selectedInputDeviceId.value">
-          Usar entrada selecionada
-        </button>
       </div>
 
       <section class="ks-section">
         <div class="section-header">
-          <h2>Sketch</h2>
-          <span class="section-chip">{{ playMode ? `${sketchName} | Play ${playCountdown}s` : sketchName }}</span>
+          <h2>Workspace</h2>
+          <span class="section-chip">{{ projectionMapperOpen ? "Mapper" : "View" }}</span>
         </div>
-        <label class="ks-select">
-          <span>Selecionar design</span>
-          <select :value="currentSketchIndex" @change="selectSketchByIndex">
-            <option v-for="option in sketchOptions" :key="option.index" :value="option.index">
-              {{ option.code }}{{ option.label !== option.code ? ` - ${option.label}` : "" }}
-            </option>
-          </select>
-        </label>
-        <label class="ks-select">
-          <span>Estilo visual</span>
-          <select :value="visualStyle" @change="selectVisualStyle">
-            <option v-for="style in VISUAL_STYLES" :key="style.id" :value="style.id">
-              {{ style.label }}
-            </option>
-          </select>
-        </label>
-        <div class="level-list">
-          <div class="level-row">
-            <span>Grave / movimento</span>
-            <div class="level-bar">
-              <div
-                class="level-bar__fill"
-                :style="{ transform: `scaleX(${Math.max(0.04, Math.min(1, audio.motionAmount.value))})` }"
-              ></div>
-            </div>
-            <strong>{{ Math.round(audio.motionAmount.value * 100) }}%</strong>
-          </div>
-          <div class="level-row">
-            <span>Medio / pisca</span>
-            <div class="level-bar">
-              <div
-                class="level-bar__fill level-bar__fill--hot"
-                :style="{ transform: `scaleX(${Math.max(0.04, Math.min(1, audio.blink.value))})` }"
-              ></div>
-            </div>
-            <strong>{{ Math.round(audio.blink.value * 100) }}%</strong>
-          </div>
-          <div class="level-row">
-            <span>Agudo / cor</span>
-            <div class="level-bar">
-              <div
-                class="level-bar__fill level-bar__fill--cool"
-                :style="{ transform: `scaleX(${Math.max(0.04, Math.min(1, audio.colorIntensity.value))})` }"
-              ></div>
-            </div>
-            <strong>{{ Math.round(audio.colorIntensity.value * 100) }}%</strong>
-          </div>
-        </div>
+        <nav class="ks-mode-tabs" aria-label="Modo da tela">
+          <button class="ks-mode-tabs__tab" :class="{ 'is-active': !projectionMapperOpen }" @click="setWorkspaceMode('visualizer')">
+            View
+          </button>
+          <button class="ks-mode-tabs__tab" :class="{ 'is-active': projectionMapperOpen }" @click="setWorkspaceMode('mapper')">
+            Mapper
+          </button>
+        </nav>
       </section>
 
+      <section class="ks-section">
+        <div class="section-header">
+          <h2>Audio</h2>
+          <span class="section-chip" :class="{ 'section-chip--live': audio.running.value }">{{ currentAudioSourceLabel }}</span>
+        </div>
+        <button @click="openAudioModal">Entradas de audio</button>
+        <p class="ks-footnote">{{ audio.status.value }}</p>
+      </section>
+
+      <section class="ks-section">
+        <div class="section-header">
+          <h2>View</h2>
+          <span class="section-chip">{{ qualityModeLabel }}</span>
+        </div>
+
+        <div class="ks-icon-row ks-actions--spaced" aria-label="Controles da view">
+          <button class="ghost ks-icon-button" title="Anterior" aria-label="Anterior" @click="previousSketch">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M15 6l-6 6 6 6" />
+            </svg>
+          </button>
+          <button class="ghost ks-icon-button" :class="{ 'is-active': playMode }" title="Play" aria-label="Play" @click="startPlayMode">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M8 6l10 6-10 6z" />
+            </svg>
+          </button>
+          <button class="ghost ks-icon-button" title="Parar" aria-label="Parar" @click="stopPlayMode" :disabled="!playMode">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M8 8h8v8H8z" />
+            </svg>
+          </button>
+          <button class="ghost ks-icon-button" title="Proximo" aria-label="Proximo" @click="nextSketch">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M9 6l6 6-6 6" />
+            </svg>
+          </button>
+          <button class="ghost ks-icon-button" title="Fullscreen" aria-label="Fullscreen" @click="viewport.toggleFullscreen">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M8 4H4v4M16 4h4v4M20 16v4h-4M4 16v4h4" />
+            </svg>
+          </button>
+        </div>
+
+        <nav class="ks-mode-tabs ks-mode-tabs--compact" aria-label="Qualidade da view">
+          <button
+            v-for="mode in QUALITY_MODES"
+            :key="mode.id"
+            class="ks-mode-tabs__tab"
+            :class="{ 'is-active': qualityMode === mode.id }"
+            @click="setQualityMode(mode.id)"
+          >
+            {{ mode.label }}
+          </button>
+        </nav>
+        <p class="ks-footnote">Home/End alterna entre os 3 modos. Alt + Enter joga direto para Alta perf se a tela pesar.</p>
+
+        <p class="ks-footnote">Ctrl + cima/baixo alterna entre Original, Pixel, PB Serrilhado e CRT. Alt + Shift + E liga o ASCII. Atual: {{ visualStyleLabel }}.</p>
+
+        <div v-if="DESIGN_SANDBOX_ENABLED && isDesign51Active" class="ks-actions ks-actions--spaced">
+          <button class="ghost" :class="{ 'is-active': design51EditorOpen }" @click="toggleDesign51Editor">Editor 51</button>
+        </div>
+      </section>
     </aside>
 
-    <aside v-if="isDesign51Active" class="ks-editor" :class="{ 'is-hidden': !design51EditorVisible }">
+    <div v-if="audioModalOpen" class="ks-modal-backdrop" @click="closeAudioModal">
+      <section class="ks-modal" aria-label="Configuracao de audio" @click.stop>
+        <div class="ks-modal__top">
+          <div>
+            <p class="eyebrow">Audio</p>
+            <h2>Entradas de audio</h2>
+          </div>
+          <button class="ghost" @click="closeAudioModal">Fechar</button>
+        </div>
+
+        <nav class="ks-mode-tabs ks-mode-tabs--compact" aria-label="Entradas de audio">
+          <button
+            v-for="tab in AUDIO_CAPTURE_TABS"
+            :key="tab.id"
+            class="ks-mode-tabs__tab"
+            :class="{ 'is-active': audioCaptureTab === tab.id }"
+            @click="setAudioCaptureTab(tab.id)"
+          >
+            {{ tab.label }}
+          </button>
+        </nav>
+
+        <template v-if="audioCaptureTab === 'desktop'">
+          <div class="ks-actions">
+            <button @click="connectDesktopSystemAudio" :disabled="audio.busy.value">Conectar sistema</button>
+            <button class="ghost" @click="audio.refreshDesktopSources">Atualizar lista</button>
+            <button class="ghost" @click="audio.stop" :disabled="!audio.running.value">Parar audio</button>
+          </div>
+        </template>
+
+        <template v-else-if="audioCaptureTab === 'application'">
+          <p v-if="!isElectronRuntime()" class="ks-footnote">A selecao de aplicativo especifico fica disponivel na versao desktop do Electron.</p>
+          <template v-else>
+            <label class="ks-select">
+              <span>Aplicativo ou janela</span>
+              <select :value="audio.selectedDesktopSourceId.value" @change="handleDesktopSourceChange">
+                <option v-for="source in audio.desktopSources.value" :key="source.id" :value="source.id">
+                  {{ source.label }}
+                </option>
+              </select>
+            </label>
+            <div class="ks-actions">
+              <button @click="connectSelectedDesktopSource" :disabled="audio.busy.value || !audio.selectedDesktopSourceId.value">
+                Conectar aplicativo
+              </button>
+              <button class="ghost" @click="audio.refreshDesktopSources">Atualizar lista</button>
+              <button class="ghost" @click="audio.stop" :disabled="!audio.running.value">Parar audio</button>
+            </div>
+            <p class="ks-footnote">{{ activeDesktopSourceLabel }}</p>
+          </template>
+        </template>
+
+        <template v-else>
+          <label class="ks-select">
+            <span>Microfone</span>
+            <select :value="audio.selectedInputDeviceId.value" @change="handleAudioInputDeviceChange">
+              <option v-for="device in audio.inputDevices.value" :key="device.deviceId" :value="device.deviceId">
+                {{ device.label }}
+              </option>
+            </select>
+          </label>
+          <div class="ks-actions">
+            <button @click="connectSelectedAudioInput" :disabled="audio.busy.value || !audio.selectedInputDeviceId.value">Conectar microfone</button>
+            <button class="ghost" @click="audio.refreshInputDevices">Atualizar lista</button>
+            <button class="ghost" @click="audio.stop" :disabled="!audio.running.value">Parar audio</button>
+          </div>
+        </template>
+
+        <p class="ks-status" :class="{ error: audio.error.value }">{{ audio.status.value }}</p>
+      </section>
+    </div>
+
+    <aside v-if="DESIGN_SANDBOX_ENABLED && isDesign51Active" class="ks-editor" :class="{ 'is-hidden': !design51EditorVisible }">
       <div class="ks-editor__top">
         <div>
           <p class="eyebrow">Design 51</p>
@@ -1372,7 +1945,7 @@ onBeforeUnmount(() => {
         </div>
         <div class="ks-editor__actions">
           <button class="ghost" @click="downloadCurrentSketchJson">Baixar JSON</button>
-          <button v-if="!isDesign51Active" class="ghost" @click="cloneCurrentSketchTo51">Clonar no 51</button>
+          <button v-if="DESIGN_SANDBOX_ENABLED && !isDesign51Active" class="ghost" @click="cloneCurrentSketchTo51">Clonar no 51</button>
           <button class="ghost" @click="toggleDesignInspector">Fechar</button>
         </div>
       </div>

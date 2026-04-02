@@ -40,13 +40,22 @@ function closeWindow() {
   window.close();
 }
 
+function handleKeydown(event) {
+  if (event.repeat || event.ctrlKey || event.altKey || event.metaKey) return;
+  if (event.key.toLowerCase() !== "r") return;
+  event.preventDefault();
+  postCommand("panic-reload");
+}
+
 onMounted(() => {
   ensureChannel();
   document.body.classList.add("popup-only-visualizer");
   channel?.postMessage({ type: "mapper-popup-ready" });
+  window.addEventListener("keydown", handleKeydown);
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener("keydown", handleKeydown);
   channel?.postMessage({ type: "mapper-popup-closing" });
   channel?.close();
 });

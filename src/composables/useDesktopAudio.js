@@ -1,5 +1,7 @@
 import { onBeforeUnmount, ref } from "vue";
 
+const AUDIO_ANALYSIS_FRAME_MS = 1000 / 45;
+
 function clamp(value, min = 0, max = 1) {
   return Math.min(max, Math.max(min, value));
 }
@@ -13,12 +15,14 @@ export function useDesktopAudio() {
   const audioContext = ref(null);
   const analyserNode = ref(null);
   const sourceNode = ref(null);
+  const desktopSources = ref([]);
   const inputDevices = ref([]);
+  const selectedDesktopSourceId = ref("");
   const selectedInputDeviceId = ref("");
   const sourceMode = ref("desktop");
   const running = ref(false);
   const busy = ref(false);
-  const status = ref("Conecte o audio do desktop para alimentar o visualizer.");
+  const status = ref("Conecte o audio do sistema, de um aplicativo ou de um microfone.");
   const error = ref(false);
   const bass = ref(0);
   const mids = ref(0);
@@ -32,6 +36,7 @@ export function useDesktopAudio() {
   let previousBass = 0;
   let previousMids = 0;
   let previousHighs = 0;
+  let rafId = 0;
 
   function isElectronRuntime() {
     return Boolean(window.bassReactorElectron?.isElectron);
@@ -40,6 +45,17 @@ export function useDesktopAudio() {
   function normalizeDeviceLabel(device, index) {
     if (device?.label) return device.label;
     return `Entrada ${index + 1}`;
+  }
+
+  function inferDesktopSourceKind(sourceId = "") {
+    return String(sourceId).startsWith("window:") ? "window" : "screen";
+  }
+
+  function normalizeDesktopSourceLabel(source, index) {
+    const kind = String(source?.kind || inferDesktopSourceKind(source?.id || ""));
+    const name = source?.name || (kind === "window" ? `Janela ${index + 1}` : `Tela ${index + 1}`);
+    if (source?.label) return source.label;
+    return kind === "window" ? `Aplicativo · ${name}` : `Tela · ${name}`;
   }
 
   async function refreshInputDevices() {
@@ -62,7 +78,43 @@ export function useDesktopAudio() {
     }
   }
 
+  async function refreshDesktopSources() {
+    if (!isElectronRuntime() || typeof window.bassReactorElectron?.listDesktopCaptureSources !== "function") {
+      desktopSources.value = [];
+      selectedDesktopSourceId.value = "";
+      return;
+    }
+
+    try {
+      const sources = await window.bassReactorElectron.listDesktopCaptureSources();
+      desktopSources.value = (Array.isArray(sources) ? sources : [])
+        .map((source, index) => ({
+          id: String(source?.id || ""),
+          kind: String(source?.kind || inferDesktopSourceKind(source?.id || "")),
+          name: String(source?.name || ""),
+          label: normalizeDesktopSourceLabel(source, index),
+        }))
+        .filter((source) => source.id);
+
+      if (!desktopSources.value.length) {
+        selectedDesktopSourceId.value = "";
+        return;
+      }
+
+      const hasSelectedSource = desktopSources.value.some((source) => source.id === selectedDesktopSourceId.value);
+      if (hasSelectedSource) return;
+
+      const preferredSource = desktopSources.value.find((source) => source.kind === "screen") || desktopSources.value[0];
+      selectedDesktopSourceId.value = preferredSource?.id || "";
+    } catch {
+      desktopSources.value = [];
+      selectedDesktopSourceId.value = "";
+    }
+  }
+
   function stop(stopTracks = true) {
+    cancelTickLoop();
+
     if (stopTracks && streamHandle.value) {
       streamHandle.value.getTracks().forEach((track) => track.stop());
     }
@@ -102,6 +154,34 @@ export function useDesktopAudio() {
     previousHighs = 0;
   }
 
+  function stripUnusedVideoTracks(stream) {
+    if (!(stream instanceof MediaStream)) return stream;
+
+    stream.getVideoTracks().forEach((track) => {
+      try {
+        stream.removeTrack(track);
+      } catch {}
+
+      try {
+        track.stop();
+      } catch {}
+    });
+
+    return stream;
+  }
+
+  function cancelTickLoop() {
+    if (!rafId) return;
+    window.cancelAnimationFrame(rafId);
+    rafId = 0;
+  }
+
+  function scheduleTickLoop() {
+    if (rafId || !running.value) return;
+    lastTickAt = 0;
+    rafId = window.requestAnimationFrame(tick);
+  }
+
   async function connectStream(nextStream, nextMode = "desktop", successStatus = "Captura ativa.") {
     const [audioTrack] = nextStream.getAudioTracks();
     if (!audioTrack) {
@@ -111,6 +191,9 @@ export function useDesktopAudio() {
           throw new Error("Nenhum audio do sistema foi capturado. Confirme se existe som sendo reproduzido na saida padrao do Windows.");
         }
         throw new Error("Nenhum audio foi compartilhado. Ative 'Compartilhar audio' na janela do navegador.");
+      }
+      if (nextMode === "application") {
+        throw new Error("Nenhum audio foi capturado do aplicativo ou janela selecionada.");
       }
       throw new Error("Nenhum audio foi capturado da entrada selecionada.");
     }
@@ -125,6 +208,8 @@ export function useDesktopAudio() {
     const nextSource = ctx.createMediaStreamSource(nextStream);
     nextSource.connect(nextAnalyser);
 
+    stripUnusedVideoTracks(nextStream);
+
     streamHandle.value = nextStream;
     audioContext.value = ctx;
     analyserNode.value = nextAnalyser;
@@ -134,17 +219,18 @@ export function useDesktopAudio() {
     sourceMode.value = nextMode;
     status.value = successStatus;
 
-    nextStream.getTracks().forEach((track) => {
+    nextStream.getAudioTracks().forEach((track) => {
       track.addEventListener("ended", () => {
         stop(false);
         status.value = "A captura foi encerrada.";
       });
     });
 
-    await refreshInputDevices();
+    scheduleTickLoop();
+    await Promise.all([refreshInputDevices(), refreshDesktopSources()]);
   }
 
-  async function connectDesktop() {
+  async function connectDesktop(sourceId = "") {
     if (!navigator.mediaDevices?.getDisplayMedia) {
       error.value = true;
       status.value = "Este navegador nao suporta captura de audio do desktop.";
@@ -158,9 +244,24 @@ export function useDesktopAudio() {
     try {
       stop(true);
 
+      const requestedSourceId = String(sourceId || "");
+      if (isElectronRuntime() && typeof window.bassReactorElectron?.setDesktopCaptureSource === "function") {
+        await window.bassReactorElectron.setDesktopCaptureSource(requestedSourceId);
+      }
+
+      const selectedSource =
+        desktopSources.value.find((source) => source.id === requestedSourceId) ||
+        desktopSources.value.find((source) => source.id === selectedDesktopSourceId.value) ||
+        null;
+      const captureLabel = selectedSource?.label || "audio do sistema";
+      const captureMode = selectedSource?.kind === "window" ? "application" : "desktop";
+
       let nextStream;
       if (isElectronRuntime()) {
-        status.value = "Capturando audio do sistema via Electron...";
+        status.value =
+          requestedSourceId && selectedSource
+            ? `Capturando audio via ${captureLabel}...`
+            : "Capturando audio do sistema via Electron...";
         nextStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: true,
@@ -183,7 +284,14 @@ export function useDesktopAudio() {
           });
         }
       }
-      await connectStream(nextStream, "desktop", "Captura ativa. O renderer Vue agora usa o stack visual do Kaleidosync com audio do desktop.");
+      if (requestedSourceId) {
+        selectedDesktopSourceId.value = requestedSourceId;
+      }
+      await connectStream(
+        nextStream,
+        captureMode,
+        captureMode === "application" ? `Captura ativa via ${captureLabel}.` : "Captura ativa. O renderer Vue agora usa o stack visual do Kaleidosync com audio do desktop."
+      );
     } catch (caughtError) {
       const message = caughtError instanceof Error ? caughtError.message : "Falha ao iniciar a captura.";
       stop(true);
@@ -235,8 +343,6 @@ export function useDesktopAudio() {
     }
   }
 
-  let rafId = 0;
-
   function getBandAverage(startHz, endHz) {
     if (!analyserNode.value || !audioContext.value || !frequencyData) return 0;
 
@@ -254,52 +360,62 @@ export function useDesktopAudio() {
     return sum / Math.max(1, endBin - startBin) / 255;
   }
 
-  function tick() {
-    if (running.value) {
-      try {
-        const now = window.performance.now();
-        const frameDelta = lastTickAt ? now - lastTickAt : 1000 / 60;
-        lastTickAt = now;
+  function tick(now) {
+    rafId = 0;
+    if (!running.value) return;
 
-        if (analyserNode.value && frequencyData) {
-          analyserNode.value.getByteFrequencyData(frequencyData);
-          bass.value = roundLevel(getBandAverage(20, 160));
-          mids.value = roundLevel(getBandAverage(160, 2200));
-          highs.value = roundLevel(getBandAverage(2200, 12000));
+    try {
+      const frameNow = typeof now === "number" && Number.isFinite(now) ? now : window.performance.now();
+      const frameDelta = lastTickAt ? frameNow - lastTickAt : AUDIO_ANALYSIS_FRAME_MS;
 
-          const bassAttack = Math.max(0, bass.value - previousBass);
-          const midsAttack = Math.max(0, mids.value - previousMids);
-          const highsAttack = Math.max(0, highs.value - previousHighs);
-          const frameScale = frameDelta / (1000 / 60);
-          const nextMotionAmount = clamp(bass.value * 0.56 + bassAttack * 1.08, 0, 0.72);
-          const nextBlink = clamp(mids.value * 0.86 + midsAttack * 1.75, 0, 1.15);
-          const nextColor = clamp(highs.value * 0.94 + highsAttack * 1.4, 0, 1.2);
-
-          motionAmount.value = roundLevel(clamp(motionAmount.value * 0.72 + nextMotionAmount * 0.28, 0, 0.72));
-          motionStream.value = roundLevel(motionStream.value + motionAmount.value * (0.14 + bass.value * 0.42) * frameScale);
-          blink.value = roundLevel(clamp(blink.value * 0.48 + nextBlink * 0.72, 0, 1.15));
-          colorIntensity.value = roundLevel(clamp(colorIntensity.value * 0.72 + nextColor * 0.4, 0, 1.2));
-
-          previousBass = bass.value;
-          previousMids = mids.value;
-          previousHighs = highs.value;
-        }
-      } catch (caughtError) {
-        running.value = false;
-        error.value = true;
-        status.value = caughtError instanceof Error ? caughtError.message : "Falha ao processar o audio do desktop.";
+      if (frameDelta < AUDIO_ANALYSIS_FRAME_MS * 0.9) {
+        rafId = window.requestAnimationFrame(tick);
+        return;
       }
+
+      lastTickAt = frameNow;
+
+      if (analyserNode.value && frequencyData) {
+        analyserNode.value.getByteFrequencyData(frequencyData);
+        bass.value = roundLevel(getBandAverage(20, 160));
+        mids.value = roundLevel(getBandAverage(160, 2200));
+        highs.value = roundLevel(getBandAverage(2200, 12000));
+
+        const bassAttack = Math.max(0, bass.value - previousBass);
+        const midsAttack = Math.max(0, mids.value - previousMids);
+        const highsAttack = Math.max(0, highs.value - previousHighs);
+        const frameScale = frameDelta / (1000 / 60);
+        const nextMotionAmount = clamp(bass.value * 0.56 + bassAttack * 1.08, 0, 0.72);
+        const nextBlink = clamp(mids.value * 0.86 + midsAttack * 1.75, 0, 1.15);
+        const nextColor = clamp(highs.value * 0.94 + highsAttack * 1.4, 0, 1.2);
+
+        motionAmount.value = roundLevel(clamp(motionAmount.value * 0.72 + nextMotionAmount * 0.28, 0, 0.72));
+        motionStream.value = roundLevel(motionStream.value + motionAmount.value * (0.14 + bass.value * 0.42) * frameScale);
+        blink.value = roundLevel(clamp(blink.value * 0.48 + nextBlink * 0.72, 0, 1.15));
+        colorIntensity.value = roundLevel(clamp(colorIntensity.value * 0.72 + nextColor * 0.4, 0, 1.2));
+
+        previousBass = bass.value;
+        previousMids = mids.value;
+        previousHighs = highs.value;
+      }
+    } catch (caughtError) {
+      running.value = false;
+      error.value = true;
+      status.value = caughtError instanceof Error ? caughtError.message : "Falha ao processar o audio do desktop.";
+      cancelTickLoop();
+      return;
     }
+
     rafId = window.requestAnimationFrame(tick);
   }
 
   if (typeof window !== "undefined") {
-    rafId = window.requestAnimationFrame(tick);
     refreshInputDevices();
+    refreshDesktopSources();
   }
 
   onBeforeUnmount(() => {
-    window.cancelAnimationFrame(rafId);
+    cancelTickLoop();
     stop(true);
   });
 
@@ -315,11 +431,14 @@ export function useDesktopAudio() {
     busy,
     status,
     error,
+    desktopSources,
     inputDevices,
+    selectedDesktopSourceId,
     selectedInputDeviceId,
     sourceMode,
     connectDesktop,
     connectInputDevice,
+    refreshDesktopSources,
     refreshInputDevices,
     stop,
   };

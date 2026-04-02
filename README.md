@@ -39,7 +39,7 @@ npm run dev
 
 - `npm run dev:desktop`: abre o app desktop em modo dev (Vite + Electron).
 - `npm run desktop`: gera o build web e abre no Electron.
-- `npm run clean:release`: remove artefatos antigos de build (`release/` e `release-new/`).
+- `npm run clean:release`: remove artefatos antigos de build da pasta `release/`.
 - `npm run dist:win`: limpa artefatos antigos e gera executavel Windows (`.exe`) portatil na pasta `release/`.
 
 No modo Electron, o atalho global do sistema `Numpad /` (tecla `/` do numpad) troca o design de forma aleatoria mesmo com o app em segundo plano.

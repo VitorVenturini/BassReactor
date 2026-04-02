@@ -1,0 +1,4 @@
+
+> bass-reactor-vue@1.0.0 dev:desktop
+> concurrently -k "vite --host 127.0.0.1 --port 5173" "wait-on tcp:5173 && node scripts/launch-electron-dev.cjs"
+

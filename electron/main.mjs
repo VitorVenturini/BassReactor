@@ -8,23 +8,131 @@ const RANDOM_VISUAL_EVENT = "bass-reactor:random-visual";
 const RANDOM_VISUAL_REQUEST = "bass-reactor:trigger-random-visual";
 const OPEN_MAPPER_POPUP_REQUEST = "bass-reactor:open-mapper-popup";
 const CLOSE_MAPPER_POPUP_REQUEST = "bass-reactor:close-mapper-popup";
+const LIST_DESKTOP_CAPTURE_SOURCES_REQUEST = "bass-reactor:list-desktop-capture-sources";
+const SET_DESKTOP_CAPTURE_SOURCE_REQUEST = "bass-reactor:set-desktop-capture-source";
+const RELOAD_ALL_WINDOWS_REQUEST = "bass-reactor:reload-all-windows";
 const GLOBAL_VISUAL_SHORTCUTS = [
   { accelerator: "NumDiv", family: "random" },
   { accelerator: "CommandOrControl+Q", family: "random" },
   { accelerator: "Alt+Q", family: "random" },
   { accelerator: "Alt+W", family: "kaleido" },
   { accelerator: "Alt+E", family: "black-hole" },
+  { accelerator: "Alt+Shift+E", family: "style-ascii" },
   { accelerator: "Alt+T", family: "color-backdrop-filter" },
   { accelerator: "Alt+Y", family: "cell-microscope" },
   { accelerator: "Alt+U", family: "ink-mix" },
   { accelerator: "Alt+I", family: "motion-twin" },
   { accelerator: "Alt+O", family: "bubble-build" },
   { accelerator: "Alt+X", family: "next-order" },
+  { accelerator: "Alt+Enter", family: "quality-performance" },
+  { accelerator: "Control+Up", family: "style-prev" },
+  { accelerator: "Control+Down", family: "style-next" },
 ];
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL);
+let preferredDesktopCaptureSourceId = "";
+
+function isBrokenPipeError(error) {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === "EPIPE");
+}
+
+function guardConsoleStream(stream) {
+  if (!stream || typeof stream.on !== "function") return;
+
+  stream.on("error", (error) => {
+    if (isBrokenPipeError(error)) {
+      return;
+    }
+    setImmediate(() => {
+      throw error;
+    });
+  });
+}
+
+function canWriteToStream(stream) {
+  return Boolean(stream?.writable && !stream.destroyed && !stream.writableEnded);
+}
+
+function writeConsole(method, args) {
+  const targetStream = method === "warn" || method === "error" ? process.stderr : process.stdout;
+  if (!canWriteToStream(targetStream)) return;
+
+  try {
+    console[method](...args);
+  } catch (error) {
+    if (!isBrokenPipeError(error)) {
+      throw error;
+    }
+  }
+}
+
+function safeLog(...args) {
+  writeConsole("log", args);
+}
+
+function safeWarn(...args) {
+  writeConsole("warn", args);
+}
+
+function safeError(...args) {
+  writeConsole("error", args);
+}
+
+guardConsoleStream(process.stdout);
+guardConsoleStream(process.stderr);
+
+function wait(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function inferDesktopCaptureKind(sourceId = "") {
+  return String(sourceId).startsWith("window:") ? "window" : "screen";
+}
+
+async function getDesktopCaptureSources() {
+  const sources = await desktopCapturer.getSources({
+    types: ["window", "screen"],
+    fetchWindowIcons: false,
+    thumbnailSize: {
+      width: 16,
+      height: 16,
+    },
+  });
+
+  return sources
+    .map((source, index) => {
+      const kind = inferDesktopCaptureKind(source.id);
+      const fallbackName = kind === "screen" ? `Tela ${index + 1}` : `Janela ${index + 1}`;
+      const name = source.name || fallbackName;
+      return {
+        id: source.id,
+        name,
+        kind,
+        label: kind === "screen" ? `Tela · ${name}` : `Aplicativo · ${name}`,
+      };
+    })
+    .sort((left, right) => {
+      if (left.kind === right.kind) {
+        return left.name.localeCompare(right.name, "pt-BR");
+      }
+      return left.kind === "screen" ? -1 : 1;
+    });
+}
+
+function pickDesktopCaptureSource(sources) {
+  if (!Array.isArray(sources) || !sources.length) return null;
+
+  if (preferredDesktopCaptureSourceId) {
+    const preferredSource = sources.find((source) => source.id === preferredDesktopCaptureSourceId);
+    if (preferredSource) return preferredSource;
+  }
+
+  return sources.find((source) => inferDesktopCaptureKind(source.id) === "screen") || sources[0] || null;
+}
 
 function getMainEntry() {
   if (isDev) {
@@ -53,8 +161,32 @@ function createWindowOptions() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      backgroundThrottling: false,
     },
   };
+}
+
+async function loadWindowEntry(browserWindow, entryResolver) {
+  const maxAttempts = isDev ? 30 : 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      if (isDev) {
+        await browserWindow.loadURL(entryResolver());
+      } else {
+        await browserWindow.loadFile(entryResolver());
+      }
+      return;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error || "");
+      const shouldRetry = isDev && message.includes("ERR_CONNECTION_REFUSED") && attempt < maxAttempts;
+      if (!shouldRetry) {
+        throw error;
+      }
+      safeWarn(`[BassReactor] Dev server ainda indisponivel, tentativa ${attempt}/${maxAttempts}.`);
+      await wait(1000);
+    }
+  }
 }
 
 function createMainWindow() {
@@ -65,10 +197,23 @@ function createMainWindow() {
   });
 
   if (isDev) {
-    mainWindow.loadURL(getMainEntry());
-  } else {
-    mainWindow.loadFile(getMainEntry());
+    mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+      safeLog(`[BassReactor][renderer:${level}] ${message} (${sourceId}:${line})`);
+    });
+    mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+      safeError(`[BassReactor] Renderer falhou ao carregar ${validatedURL}: ${errorCode} ${errorDescription}`);
+    });
+    mainWindow.webContents.on("render-process-gone", (_event, details) => {
+      safeError("[BassReactor] Renderer encerrou:", details);
+    });
+    mainWindow.webContents.on("did-finish-load", () => {
+      safeLog("[BassReactor] Renderer carregado.");
+    });
   }
+
+  loadWindowEntry(mainWindow, getMainEntry).catch((error) => {
+    safeError("[BassReactor] Falha ao abrir a janela principal:", error);
+  });
 
   return mainWindow;
 }
@@ -94,14 +239,13 @@ function createMapperPopupWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      backgroundThrottling: false,
     },
   });
 
-  if (isDev) {
-    mapperPopupWindow.loadURL(getMapperPopupEntry());
-  } else {
-    mapperPopupWindow.loadFile(getMapperPopupEntry());
-  }
+  loadWindowEntry(mapperPopupWindow, getMapperPopupEntry).catch((error) => {
+    safeError("[BassReactor] Falha ao abrir o popup do mapper:", error);
+  });
 
   mapperPopupWindow.on("closed", () => {
     mapperPopupWindow = null;
@@ -133,8 +277,15 @@ function configureDesktopCapture() {
   defaultSession.setDisplayMediaRequestHandler(
     async (_request, callback) => {
       try {
-        const sources = await desktopCapturer.getSources({ types: ["screen"] });
-        const source = sources[0];
+        const sources = await desktopCapturer.getSources({
+          types: ["window", "screen"],
+          fetchWindowIcons: false,
+          thumbnailSize: {
+            width: 16,
+            height: 16,
+          },
+        });
+        const source = pickDesktopCaptureSource(sources);
         if (!source) {
           callback({});
           return;
@@ -144,7 +295,7 @@ function configureDesktopCapture() {
           audio: "loopback",
         });
       } catch (error) {
-        console.error("[BassReactor] Falha ao configurar captura de desktop:", error);
+        safeError("[BassReactor] Falha ao configurar captura de desktop:", error);
         callback({});
       }
     },
@@ -170,6 +321,13 @@ function broadcastVisualShortcut(family, source) {
   }
 }
 
+function reloadAllWindows() {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue;
+    win.webContents.reload();
+  }
+}
+
 function registerGlobalShortcuts() {
   for (const shortcut of GLOBAL_VISUAL_SHORTCUTS) {
     const accelerator = shortcut.accelerator;
@@ -177,7 +335,7 @@ function registerGlobalShortcuts() {
       broadcastVisualShortcut(shortcut.family, "global-shortcut");
     });
     if (!ok) {
-      console.warn(`[BassReactor] Falha ao registrar atalho global: ${accelerator}`);
+      safeWarn(`[BassReactor] Falha ao registrar atalho global: ${accelerator}`);
     }
   }
 }
@@ -197,6 +355,27 @@ ipcMain.on(OPEN_MAPPER_POPUP_REQUEST, () => {
 
 ipcMain.on(CLOSE_MAPPER_POPUP_REQUEST, () => {
   closeMapperPopupWindow();
+});
+
+ipcMain.on(RELOAD_ALL_WINDOWS_REQUEST, () => {
+  reloadAllWindows();
+});
+
+ipcMain.handle(LIST_DESKTOP_CAPTURE_SOURCES_REQUEST, async () => {
+  try {
+    return await getDesktopCaptureSources();
+  } catch (error) {
+    safeError("[BassReactor] Falha ao listar fontes de captura:", error);
+    return [];
+  }
+});
+
+ipcMain.handle(SET_DESKTOP_CAPTURE_SOURCE_REQUEST, async (_event, payload) => {
+  preferredDesktopCaptureSourceId = typeof payload?.sourceId === "string" ? payload.sourceId : "";
+  return {
+    ok: true,
+    sourceId: preferredDesktopCaptureSourceId,
+  };
 });
 
 app.whenReady().then(() => {

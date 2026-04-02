@@ -1,15 +1,84 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { Mesh, OrthographicCamera, PlaneGeometry, Scene, ShaderMaterial } from "three";
 import ShaderScroll from "@wearesage/vue/components/webgl/ShaderScroll.vue";
 import { useSketches } from "@wearesage/vue/stores/sketches";
 import { useViewport } from "@wearesage/vue/stores/viewport";
 import { useUI } from "@wearesage/vue/stores/ui";
 import { useAnimation, useRAF } from "@wearesage/vue";
+import { DEFAULT_FRAGMENT_SHADER, DEFAULT_VERTEX_SHADER, GLSL_UTILS } from "@wearesage/vue/constants/glsl-defaults";
 import StageSketchMesh from "./StageSketchMesh.vue";
 
 const DESIGN_TRANSITION_MS = 900;
+const PERFORMANCE_SAMPLE_WINDOW_MS = 500;
 const ASCII_STYLE_ID = "ascii-bw";
 const ASCII_CHARS = " .,:;irsXA253hMHGS#9B&@";
+const SHADER_DEFS = ["precision highp float;", "#define PI 3.14159265359", "#define TWO_PI 2. * PI", "varying vec2 vUv;"].join("\n");
+const QUALITY_MODE_CONFIG = {
+  performance: {
+    label: "Alta perf",
+    activeFps: 30,
+    idleFps: 20,
+    hiddenFps: 8,
+    prewarmLimit: 1,
+    dprMinScale: 1,
+    dprMaxScale: 1.05,
+    initialDprScale: 1,
+    targetFps: 28,
+    targetFpsHysteresis: 2,
+    dprStepUp: 0.01,
+    dprStepDownSoft: 0.02,
+    dprStepDownMedium: 0.04,
+    dprStepDownHard: 0.07,
+    filterStrength: 0,
+    overlayOpacityScale: 0,
+    overlayBlurScale: 0,
+    transitionScale: 0.006,
+    asciiInterval: 120,
+  },
+  balanced: {
+    label: "Medio",
+    activeFps: 45,
+    idleFps: 30,
+    hiddenFps: 10,
+    prewarmLimit: 3,
+    dprMinScale: 1.55,
+    dprMaxScale: 1.7,
+    initialDprScale: 1.6,
+    targetFps: 40,
+    targetFpsHysteresis: 4,
+    dprStepUp: 0.015,
+    dprStepDownSoft: 0.02,
+    dprStepDownMedium: 0.035,
+    dprStepDownHard: 0.06,
+    filterStrength: 0.5,
+    overlayOpacityScale: 0.45,
+    overlayBlurScale: 0.5,
+    transitionScale: 0.012,
+    asciiInterval: 100,
+  },
+  beautiful: {
+    label: "Bonito",
+    activeFps: 60,
+    idleFps: 40,
+    hiddenFps: 12,
+    prewarmLimit: 5,
+    dprMinScale: 2.15,
+    dprMaxScale: 2.3,
+    initialDprScale: 2.2,
+    targetFps: 54,
+    targetFpsHysteresis: 4,
+    dprStepUp: 0.02,
+    dprStepDownSoft: 0.02,
+    dprStepDownMedium: 0.03,
+    dprStepDownHard: 0.05,
+    filterStrength: 1,
+    overlayOpacityScale: 1,
+    overlayBlurScale: 1,
+    transitionScale: 0.018,
+    asciiInterval: 95,
+  },
+};
 
 const props = defineProps({
   blink: {
@@ -28,6 +97,14 @@ const props = defineProps({
     type: String,
     default: "default",
   },
+  qualityMode: {
+    type: String,
+    default: "balanced",
+  },
+  showPerformanceHud: {
+    type: Boolean,
+    default: false,
+  },
 });
 
 const emit = defineEmits(["select"]);
@@ -39,21 +116,241 @@ const ui = useUI();
 const context = shallowRef();
 const activeSketchMesh = shallowRef();
 const scroll = shallowRef();
-const activeRenderIndex = shallowRef(0);
+const activeRenderEpoch = ref(0);
 const renderTime = ref(window.performance.now());
 const transitionStartAt = ref(0);
 const transitionProgress = ref(1);
 const asciiFrame = ref("");
 const asciiColumns = ref(0);
 const asciiRows = ref(0);
+const performanceFps = ref(0);
+const performanceFrameMs = ref(0);
+const performanceRenderWidth = ref(0);
+const performanceRenderHeight = ref(0);
+const performanceSampleFrames = ref(0);
+const adaptiveDpr = ref(0.34);
 let asciiCanvas = null;
 let asciiContext = null;
 let asciiMeasureCanvas = null;
 let asciiMeasureContext = null;
 let lastAsciiFrameAt = 0;
+let performanceFrameCount = 0;
+let performanceAccumulatedDelta = 0;
+let performanceLastFrameAt = 0;
+let performanceLastSampleAt = 0;
+let lastRenderAt = 0;
+const prewarmedProgramKeys = new Set();
+const queuedProgramKeys = new Set();
+let prewarmTimer = 0;
+let prewarmQueue = [];
+let prewarmInFlight = false;
+let prewarmGeometry = null;
+let prewarmCamera = null;
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+function mixNumber(from, to, amount) {
+  return from + (to - from) * amount;
+}
+
+function normalizeShaderSource(shaderCode) {
+  const source = String(shaderCode || DEFAULT_FRAGMENT_SHADER);
+  const isMainImageShader = /void\s+mainImage\s*\(\s*out\s+vec4\s+\w+\s*,\s*in\s+vec2\s+\w+\s*\)/.test(source);
+  if (!isMainImageShader) return source;
+
+  const lines = source.split("\n");
+  const globalLines = [];
+  const functionLines = [];
+  let inFunction = false;
+  let braceCount = 0;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!inFunction && /void\s+\w+\s*\(/.test(trimmed)) {
+      inFunction = true;
+      functionLines.push(line);
+      braceCount += (line.match(/\{/g) || []).length;
+      braceCount -= (line.match(/\}/g) || []).length;
+      continue;
+    }
+
+    if (inFunction) {
+      functionLines.push(line);
+      braceCount += (line.match(/\{/g) || []).length;
+      braceCount -= (line.match(/\}/g) || []).length;
+      if (braceCount <= 0) {
+        inFunction = false;
+        braceCount = 0;
+      }
+      continue;
+    }
+
+    globalLines.push(line);
+  }
+
+  return `
+${globalLines.join("\n")}
+
+${functionLines.join("\n")}
+
+void main() {
+  mainImage(gl_FragColor, gl_FragCoord.xy);
+}`;
+}
+
+function buildShaderUniformShape(sourceUniforms = {}) {
+  const nextUniforms = {
+    resolution: { value: [1, 1] },
+    time: { value: 0 },
+    stream: { value: 0 },
+    volume: { value: 1 },
+    iResolution: { value: [1, 1, 1] },
+    iTime: { value: 0 },
+    iStream: { value: 0 },
+    iVolume: { value: 1 },
+    ...Object.fromEntries(
+      Object.entries(sourceUniforms || {}).map(([key, entry]) => [
+        key,
+        {
+          value: Array.isArray(entry?.value) ? [...entry.value] : entry?.value,
+        },
+      ])
+    ),
+  };
+
+  Object.entries(sourceUniforms || {}).forEach(([key, entry]) => {
+    if (typeof entry?.value === "boolean") {
+      nextUniforms[`${key}Tween`] = { value: false };
+      nextUniforms[`${key}TweenProgress`] = { value: 0 };
+    }
+  });
+
+  return nextUniforms;
+}
+
+function buildUniformDeclarations(uniformsMap) {
+  return Object.keys(uniformsMap).reduce((acc, key) => {
+    const value = uniformsMap[key]?.value;
+    if (Array.isArray(value)) {
+      return acc + `\nuniform ${value.length === 2 ? "vec2" : "vec3"} ${key};`;
+    }
+    if (typeof value === "number") {
+      return acc + `\nuniform float ${key};`;
+    }
+    if (typeof value === "boolean") {
+      return acc + `\nuniform bool ${key};`;
+    }
+    return acc;
+  }, "");
+}
+
+function buildProgramKey(sketchValue) {
+  const shaderSource = normalizeShaderSource(sketchValue?.shader || DEFAULT_FRAGMENT_SHADER);
+  const uniformsMap = buildShaderUniformShape(sketchValue?.variants?.[0] || {});
+  const declarations = buildUniformDeclarations(uniformsMap);
+  return `${shaderSource}__${declarations}`;
+}
+
+function ensurePrewarmResources() {
+  if (!prewarmGeometry) {
+    prewarmGeometry = new PlaneGeometry(2, 2, 1, 1);
+  }
+  if (!prewarmCamera) {
+    prewarmCamera = new OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+    prewarmCamera.position.z = 1;
+  }
+}
+
+async function prewarmSketchProgram(sketchValue) {
+  const renderer = context.value?.context?.renderer?.value;
+  if (!renderer || !sketchValue?.shader) return false;
+
+  const programKey = buildProgramKey(sketchValue);
+  if (prewarmedProgramKeys.has(programKey)) return true;
+
+  ensurePrewarmResources();
+
+  const uniformsMap = buildShaderUniformShape(sketchValue?.variants?.[0] || {});
+  const declarations = buildUniformDeclarations(uniformsMap);
+  const vertexShader = `${SHADER_DEFS}${declarations}${DEFAULT_VERTEX_SHADER}`;
+  const fragmentShader = `${SHADER_DEFS}${declarations}${GLSL_UTILS}${normalizeShaderSource(sketchValue.shader || DEFAULT_FRAGMENT_SHADER)}`;
+  const prewarmScene = new Scene();
+  const material = new ShaderMaterial({
+    uniforms: uniformsMap,
+    vertexShader,
+    fragmentShader,
+  });
+  const mesh = new Mesh(prewarmGeometry, material);
+  prewarmScene.add(mesh);
+
+  try {
+    await renderer.compileAsync(prewarmScene, prewarmCamera);
+    prewarmedProgramKeys.add(programKey);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    material.dispose();
+    prewarmScene.remove(mesh);
+  }
+}
+
+function scheduleShaderPrewarm(sketchList = []) {
+  if (!Array.isArray(sketchList) || !sketchList.length) return;
+
+  sketchList.forEach((sketchValue) => {
+    const programKey = buildProgramKey(sketchValue);
+    if (prewarmedProgramKeys.has(programKey) || queuedProgramKeys.has(programKey)) return;
+    queuedProgramKeys.add(programKey);
+    prewarmQueue.push(sketchValue);
+  });
+
+  if (prewarmTimer || prewarmInFlight) return;
+
+  prewarmTimer = window.setTimeout(async () => {
+    prewarmTimer = 0;
+    if (prewarmInFlight) return;
+    prewarmInFlight = true;
+
+    try {
+      while (prewarmQueue.length) {
+        const nextSketch = prewarmQueue.shift();
+        if (!nextSketch) continue;
+        const programKey = buildProgramKey(nextSketch);
+        queuedProgramKeys.delete(programKey);
+        await prewarmSketchProgram(nextSketch);
+        await new Promise((resolve) => window.setTimeout(resolve, 48));
+      }
+    } finally {
+      prewarmInFlight = false;
+      if (prewarmQueue.length) {
+        scheduleShaderPrewarm([]);
+      }
+    }
+  }, 120);
+}
+
+function getSketchPrewarmPriorityList() {
+  const allSketches = Array.isArray(sketches.iterations) ? sketches.iterations : [];
+  if (!allSketches.length) return [];
+
+  const currentIndex = Math.max(0, sketches.index ?? 0);
+  const orderedIndexes = [];
+  for (let offset = 0; offset < allSketches.length; offset += 1) {
+    const forward = (currentIndex + offset) % allSketches.length;
+    const backward = (currentIndex - offset + allSketches.length) % allSketches.length;
+    if (!orderedIndexes.includes(forward)) orderedIndexes.push(forward);
+    if (!orderedIndexes.includes(backward)) orderedIndexes.push(backward);
+  }
+
+  return orderedIndexes.map((index) => allSketches[index]).filter(Boolean);
+}
+
+function getPrewarmBudget() {
+  return Math.max(0, Number(qualityPreset.value.prewarmLimit || 0));
 }
 
 function ensureAsciiBuffer() {
@@ -103,13 +400,32 @@ function resetAsciiFrame() {
   lastAsciiFrameAt = 0;
 }
 
+function resetPerformanceHud() {
+  performanceFps.value = 0;
+  performanceFrameMs.value = 0;
+  performanceRenderWidth.value = 0;
+  performanceRenderHeight.value = 0;
+  performanceSampleFrames.value = 0;
+  performanceFrameCount = 0;
+  performanceAccumulatedDelta = 0;
+  performanceLastFrameAt = 0;
+  performanceLastSampleAt = 0;
+}
+
+function getInitialAdaptiveDpr() {
+  const viewportPixels = Math.max(1, width.value * height.value);
+  if (viewportPixels >= 1920 * 1080) return 0.26;
+  if (viewportPixels >= 1600 * 900) return 0.3;
+  return 0.34;
+}
+
 function updateAsciiFrame(now) {
   if (props.visualStyle !== ASCII_STYLE_ID) {
     if (asciiFrame.value) resetAsciiFrame();
     return;
   }
 
-  if (now - lastAsciiFrameAt < 95) return;
+  if (now - lastAsciiFrameAt < qualityPreset.value.asciiInterval) return;
 
   const sourceCanvas = context.value?.context?.renderer?.value?.domElement;
   if (!(sourceCanvas instanceof HTMLCanvasElement)) return;
@@ -161,7 +477,8 @@ const visualStylePreset = computed(() => {
   switch (props.visualStyle) {
     case "bw-jagged":
       return {
-        dpr: 0.7,
+        minDpr: 0.22,
+        maxDpr: 0.42,
         grayscale: 1,
         sepia: 0,
         hueRotate: 0,
@@ -175,10 +492,12 @@ const visualStylePreset = computed(() => {
         colorAlphaBoost: 0,
         flashRgb: "255, 255, 255",
         colorRgb: "255, 255, 255",
+        overlayBlur: 0,
       };
     case "ascii-bw":
       return {
-        dpr: 0.55,
+        minDpr: 0.2,
+        maxDpr: 0.32,
         grayscale: 1,
         sepia: 0,
         hueRotate: 0,
@@ -192,10 +511,12 @@ const visualStylePreset = computed(() => {
         colorAlphaBoost: 0,
         flashRgb: "255, 255, 255",
         colorRgb: "255, 255, 255",
+        overlayBlur: 0,
       };
     case "halftone-cmyk":
       return {
-        dpr: 1,
+        minDpr: 0.24,
+        maxDpr: 0.46,
         grayscale: 0,
         sepia: 0,
         hueRotate: 0,
@@ -209,10 +530,12 @@ const visualStylePreset = computed(() => {
         colorAlphaBoost: 0.2,
         flashRgb: "255, 244, 220",
         colorRgb: "255, 192, 128",
+        overlayBlur: 6,
       };
     case "pixel-brutal":
       return {
-        dpr: 0.35,
+        minDpr: 0.18,
+        maxDpr: 0.32,
         grayscale: 0,
         sepia: 0,
         hueRotate: 0,
@@ -226,10 +549,13 @@ const visualStylePreset = computed(() => {
         colorAlphaBoost: 0.16,
         flashRgb: "255, 240, 214",
         colorRgb: "255, 168, 82",
+        overlayBlur: 0,
+        invert: 0,
       };
     case "pixel-brutal-xl":
       return {
-        dpr: 0.18,
+        minDpr: 0.14,
+        maxDpr: 0.24,
         grayscale: 0,
         sepia: 0,
         hueRotate: 0,
@@ -243,10 +569,13 @@ const visualStylePreset = computed(() => {
         colorAlphaBoost: 0.12,
         flashRgb: "255, 236, 206",
         colorRgb: "255, 160, 72",
+        overlayBlur: 0,
+        invert: 0,
       };
     case "crt-amber":
       return {
-        dpr: 1,
+        minDpr: 0.22,
+        maxDpr: 0.42,
         grayscale: 0.12,
         sepia: 0.82,
         hueRotate: -18,
@@ -260,10 +589,13 @@ const visualStylePreset = computed(() => {
         colorAlphaBoost: 0.22,
         flashRgb: "255, 232, 188",
         colorRgb: "255, 176, 74",
+        overlayBlur: 5,
+        invert: 0,
       };
     case "duotone-ice":
       return {
-        dpr: 1,
+        minDpr: 0.22,
+        maxDpr: 0.42,
         grayscale: 0.18,
         sepia: 0.28,
         hueRotate: 158,
@@ -277,10 +609,13 @@ const visualStylePreset = computed(() => {
         colorAlphaBoost: 0.2,
         flashRgb: "235, 246, 255",
         colorRgb: "105, 220, 255",
+        overlayBlur: 6,
+        invert: 0,
       };
     case "infrared-bloom":
       return {
-        dpr: 1,
+        minDpr: 0.22,
+        maxDpr: 0.4,
         grayscale: 0.08,
         sepia: 0.56,
         hueRotate: -34,
@@ -294,10 +629,13 @@ const visualStylePreset = computed(() => {
         colorAlphaBoost: 0.24,
         flashRgb: "255, 225, 200",
         colorRgb: "255, 94, 64",
+        overlayBlur: 4,
+        invert: 0,
       };
     default:
       return {
-        dpr: 1,
+        minDpr: 0.2,
+        maxDpr: 0.38,
         grayscale: 0,
         sepia: 0,
         hueRotate: 0,
@@ -311,37 +649,69 @@ const visualStylePreset = computed(() => {
         colorAlphaBoost: 0.18,
         flashRgb: "255, 255, 255",
         colorRgb: "101, 224, 255",
+        overlayBlur: 4,
+        invert: 0,
       };
   }
 });
 
 const width = computed(() => viewport.width);
 const height = computed(() => viewport.height);
-// dpr menor = mais pixelado e mais leve na GPU
-const dpr = computed(() => visualStylePreset.value.dpr);
-// Filtro global em cima do render final.
-// Mexa aqui para testar "look" rapido sem tocar no shader.
+const qualityPreset = computed(() => QUALITY_MODE_CONFIG[props.qualityMode] || QUALITY_MODE_CONFIG.balanced);
+const dprRange = computed(() => {
+  const minDpr = clamp(visualStylePreset.value.minDpr * qualityPreset.value.dprMinScale, 0.14, 1);
+  const maxDpr = clamp(visualStylePreset.value.maxDpr * qualityPreset.value.dprMaxScale, minDpr, 1);
+  const initialDpr = clamp(getInitialAdaptiveDpr() * qualityPreset.value.initialDprScale, minDpr, maxDpr);
+  return {
+    minDpr,
+    maxDpr,
+    initialDpr,
+  };
+});
+const dpr = computed(() => {
+  const { minDpr, maxDpr } = dprRange.value;
+  return clamp(Number(adaptiveDpr.value.toFixed(2)), minDpr, maxDpr);
+});
+const stageFilter = computed(() => {
+  const filterStrength = qualityPreset.value.filterStrength;
+  if (props.visualStyle === "default" || dpr.value <= 0.24 || filterStrength <= 0.01) {
+    return "none";
+  }
+
+  const saturateTarget = visualStylePreset.value.saturationBoost + props.colorIntensity * 1.2;
+  const brightnessTarget =
+    visualStylePreset.value.brightnessBase +
+    props.colorIntensity * visualStylePreset.value.brightnessColorBoost * 0.55 +
+    props.blink * visualStylePreset.value.brightnessBlinkBoost * 0.45;
+  const contrastTarget = visualStylePreset.value.contrastBase + props.colorIntensity * visualStylePreset.value.contrastColorBoost * 0.55;
+
+  return [
+    `saturate(${mixNumber(1, saturateTarget, filterStrength).toFixed(3)})`,
+    `brightness(${mixNumber(1, brightnessTarget, filterStrength).toFixed(3)})`,
+    `contrast(${mixNumber(1, contrastTarget, filterStrength).toFixed(3)})`,
+    `grayscale(${(visualStylePreset.value.grayscale * filterStrength).toFixed(3)})`,
+    `sepia(${(visualStylePreset.value.sepia * filterStrength).toFixed(3)})`,
+    `hue-rotate(${Math.round(visualStylePreset.value.hueRotate * filterStrength)}deg)`,
+  ].join(" ");
+});
 const styles = computed(() => ({
   width: `${width.value}px`,
   height: `${height.value}px`,
-  filter: [
-    `saturate(${(visualStylePreset.value.saturationBoost + props.colorIntensity * 1.85).toFixed(3)})`,
-    `brightness(${(visualStylePreset.value.brightnessBase + props.colorIntensity * visualStylePreset.value.brightnessColorBoost + props.blink * visualStylePreset.value.brightnessBlinkBoost).toFixed(3)})`,
-    `contrast(${(visualStylePreset.value.contrastBase + props.colorIntensity * visualStylePreset.value.contrastColorBoost).toFixed(3)})`,
-    `grayscale(${visualStylePreset.value.grayscale.toFixed(3)})`,
-    `sepia(${visualStylePreset.value.sepia.toFixed(3)})`,
-    `hue-rotate(${visualStylePreset.value.hueRotate}deg)`,
-  ].join(" "),
+  filter: stageFilter.value,
 }));
 const transitionActive = computed(() => transitionProgress.value < 1);
-const stageScale = computed(() => 1 + Math.sin(transitionProgress.value * Math.PI) * 0.018);
+const stageScale = computed(() => 1 + Math.sin(transitionProgress.value * Math.PI) * qualityPreset.value.transitionScale);
 const overlayOpacity = computed(() => {
+  if (dpr.value <= 0.22 || props.visualStyle === "default" || qualityPreset.value.overlayOpacityScale <= 0.01) {
+    return 0;
+  }
   const transitionGlow = transitionActive.value ? Math.sin(transitionProgress.value * Math.PI) * 0.22 : 0;
   const liveFlash = Math.min(0.3, props.blink * (0.1 + props.colorIntensity * 0.16));
-  return transitionGlow + liveFlash;
+  return (transitionGlow + liveFlash) * qualityPreset.value.overlayOpacityScale;
 });
 const overlayStyle = computed(() => ({
   opacity: overlayOpacity.value.toFixed(3),
+  "--overlay-blur": `${Math.round(visualStylePreset.value.overlayBlur * qualityPreset.value.overlayBlurScale)}px`,
   "--flash-alpha": (0.08 + props.blink * 0.24).toFixed(3),
   "--color-alpha": (visualStylePreset.value.colorAlphaBase + props.colorIntensity * visualStylePreset.value.colorAlphaBoost).toFixed(3),
   "--flash-rgb": visualStylePreset.value.flashRgb,
@@ -355,6 +725,70 @@ const asciiStyle = computed(() => {
     letterSpacing: `${metrics.letterSpacing.toFixed(2)}px`,
   };
 });
+const performanceViewportWidth = computed(() => Math.max(1, Math.round(width.value)));
+const performanceViewportHeight = computed(() => Math.max(1, Math.round(height.value)));
+const performanceCanvasWidth = computed(() => performanceRenderWidth.value || Math.max(1, Math.round(width.value * dpr.value)));
+const performanceCanvasHeight = computed(() => performanceRenderHeight.value || Math.max(1, Math.round(height.value * dpr.value)));
+const performanceToneClass = computed(() => {
+  if (performanceFps.value >= 55) return "is-good";
+  if (performanceFps.value >= 35) return "is-warning";
+  return "is-bad";
+});
+const performanceStyleLabel = computed(() => String(props.visualStyle || "default"));
+const performanceQualityLabel = computed(() => qualityPreset.value.label);
+
+function tuneAdaptiveDpr(nextFps) {
+  const { minDpr, maxDpr } = dprRange.value;
+  const { targetFps, targetFpsHysteresis, dprStepUp, dprStepDownSoft, dprStepDownMedium, dprStepDownHard } = qualityPreset.value;
+  let nextDpr = adaptiveDpr.value;
+
+  if (nextFps > targetFps + targetFpsHysteresis) {
+    nextDpr += dprStepUp;
+  } else if (nextFps < targetFps - 18) {
+    nextDpr -= dprStepDownHard;
+  } else if (nextFps < targetFps - 10) {
+    nextDpr -= dprStepDownMedium;
+  } else if (nextFps < targetFps - 4) {
+    nextDpr -= dprStepDownSoft;
+  }
+
+  adaptiveDpr.value = clamp(Number(nextDpr.toFixed(2)), minDpr, maxDpr);
+}
+
+function updatePerformanceHud(now) {
+  if (!performanceLastSampleAt) {
+    performanceLastSampleAt = now;
+  }
+
+  if (performanceLastFrameAt) {
+    const delta = now - performanceLastFrameAt;
+    if (delta > 0 && delta < 1000) {
+      performanceFrameCount += 1;
+      performanceAccumulatedDelta += delta;
+    }
+  }
+
+  performanceLastFrameAt = now;
+
+  const elapsed = now - performanceLastSampleAt;
+  if (elapsed < PERFORMANCE_SAMPLE_WINDOW_MS) {
+    return;
+  }
+
+  performanceSampleFrames.value = performanceFrameCount;
+  performanceFps.value = performanceFrameCount > 0 ? Number(((performanceFrameCount * 1000) / elapsed).toFixed(1)) : 0;
+  performanceFrameMs.value = performanceFrameCount > 0 ? Number((performanceAccumulatedDelta / performanceFrameCount).toFixed(1)) : 0;
+  tuneAdaptiveDpr(performanceFps.value);
+
+  const renderer = context.value?.context?.renderer?.value;
+  const canvas = renderer?.domElement;
+  performanceRenderWidth.value = canvas?.width || Math.max(1, Math.round(width.value * dpr.value));
+  performanceRenderHeight.value = canvas?.height || Math.max(1, Math.round(height.value * dpr.value));
+
+  performanceFrameCount = 0;
+  performanceAccumulatedDelta = 0;
+  performanceLastSampleAt = now;
+}
 
 function easeOutCubic(value) {
   return 1 - Math.pow(1 - value, 3);
@@ -371,6 +805,50 @@ function resolveFrameTime(value) {
   return window.performance.now();
 }
 
+function resolveTargetRenderFps() {
+  if (document.hidden) {
+    return qualityPreset.value.hiddenFps;
+  }
+
+  const audioEnergy = props.blink + props.motion + props.colorIntensity;
+  const busyScene =
+    ui.showShaderScroll ||
+    props.showPerformanceHud ||
+    props.visualStyle === ASCII_STYLE_ID ||
+    transitionStartAt.value > 0 ||
+    audioEnergy > 0.12;
+
+  return busyScene ? qualityPreset.value.activeFps : qualityPreset.value.idleFps;
+}
+
+function shouldRenderFrame(frameNow) {
+  const targetFps = Math.max(1, resolveTargetRenderFps());
+  const minFrameDelta = 1000 / targetFps;
+
+  if (!lastRenderAt) {
+    lastRenderAt = frameNow;
+    return true;
+  }
+
+  if (frameNow - lastRenderAt >= minFrameDelta) {
+    lastRenderAt = frameNow;
+    return true;
+  }
+
+  return false;
+}
+
+function resetRenderPacing() {
+  lastRenderAt = 0;
+}
+
+function handleVisibilityChange() {
+  resetRenderPacing();
+  lastAsciiFrameAt = 0;
+  performanceLastFrameAt = 0;
+  performanceLastSampleAt = window.performance.now();
+}
+
 function selectSketch(sketchValue) {
   sketches.selectSketch(sketchValue);
   ui.showShaderScroll = false;
@@ -381,27 +859,58 @@ watch(
   () => sketches.shader,
   (nextShader) => {
     if (!nextShader) return;
-    if (transitionProgress.value === 1) {
-      activeRenderIndex.value += 1;
-    }
+    activeRenderEpoch.value += 1;
     transitionStartAt.value = window.performance.now();
     transitionProgress.value = 0;
+    resetRenderPacing();
+    scheduleShaderPrewarm(getSketchPrewarmPriorityList().slice(0, getPrewarmBudget()));
   },
   { immediate: true }
 );
 
 watch(
-  () => sketches.uniformKeysSerialized,
+  () => sketches.iterations,
   () => {
-    if (!sketches.shader) return;
-    activeRenderIndex.value += 1;
+    scheduleShaderPrewarm(getSketchPrewarmPriorityList().slice(0, getPrewarmBudget()));
+  },
+  { immediate: true }
+);
+
+watch(
+  [() => sketches.index, () => sketches.uniformKeysSerialized],
+  ([nextIndex, nextUniformKeys], [previousIndex, previousUniformKeys] = []) => {
+    if (nextIndex === previousIndex && nextUniformKeys === previousUniformKeys) return;
+    activeRenderEpoch.value += 1;
+    resetRenderPacing();
+  }
+);
+
+watch(
+  [() => props.visualStyle, () => props.qualityMode],
+  () => {
+    adaptiveDpr.value = dprRange.value.initialDpr;
+    resetRenderPacing();
   },
   { immediate: true }
 );
 
 useAnimation((now) => {
   const frameNow = resolveFrameTime(now);
+
+  if (!context.value?.context) {
+    return;
+  }
+  const { renderer, scene, camera } = context.value.context;
+  if (!renderer?.value || !scene?.value || !camera?.value) {
+    return;
+  }
+
+  if (!shouldRenderFrame(frameNow)) {
+    return;
+  }
+
   renderTime.value = frameNow;
+  updatePerformanceHud(frameNow);
 
   if (transitionStartAt.value) {
     const elapsed = frameNow - transitionStartAt.value;
@@ -413,15 +922,10 @@ useAnimation((now) => {
     }
   }
 
-  if (!context.value?.context) {
-    return;
-  }
-  const { renderer, scene, camera } = context.value.context;
-  if (!renderer?.value || !scene?.value || !camera?.value) {
-    return;
-  }
   activeSketchMesh.value?.update?.(frameNow);
-  scroll.value?.update?.(frameNow);
+  if (ui.showShaderScroll) {
+    scroll.value?.update?.(frameNow);
+  }
   renderer.value.render(scene.value, camera.value);
   updateAsciiFrame(frameNow);
 });
@@ -437,12 +941,32 @@ onMounted(() => {
     sketches.sampleSketches();
   }
 
+  adaptiveDpr.value = dprRange.value.initialDpr;
+  scheduleShaderPrewarm(getSketchPrewarmPriorityList().slice(0, getPrewarmBudget()));
+
   document.body.addEventListener("wheel", handleWheel, { passive: true });
+  document.addEventListener("visibilitychange", handleVisibilityChange);
+  window.addEventListener("focus", handleVisibilityChange);
+  window.addEventListener("pageshow", handleVisibilityChange);
 });
 
 onBeforeUnmount(() => {
   document.body.removeEventListener("wheel", handleWheel);
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  window.removeEventListener("focus", handleVisibilityChange);
+  window.removeEventListener("pageshow", handleVisibilityChange);
+  window.clearTimeout(prewarmTimer);
+  prewarmTimer = 0;
+  prewarmQueue = [];
+  queuedProgramKeys.clear();
+  prewarmedProgramKeys.clear();
+  prewarmInFlight = false;
+  prewarmGeometry?.dispose?.();
+  prewarmGeometry = null;
+  prewarmCamera = null;
+  resetRenderPacing();
   resetAsciiFrame();
+  resetPerformanceHud();
 });
 </script>
 
@@ -465,7 +989,7 @@ onBeforeUnmount(() => {
 
       <StageSketchMesh
         ref="activeSketchMesh"
-        :key="`active-${activeRenderIndex}`"
+        :key="`active-${activeRenderEpoch}`"
         :width="width"
         :height="height"
         :dpr="dpr"
@@ -480,6 +1004,7 @@ onBeforeUnmount(() => {
       />
 
       <ShaderScroll
+        v-if="ui.showShaderScroll"
         ref="scroll"
         @select="selectSketch"
         :scrollY="viewport.scrollY"
@@ -494,8 +1019,45 @@ onBeforeUnmount(() => {
       />
     </TresCanvas>
     <div class="sage-renderer__overlay" :style="overlayStyle"></div>
-    <div class="sage-renderer__fx"></div>
+    <div v-if="props.qualityMode !== 'performance'" class="sage-renderer__fx"></div>
     <pre v-if="props.visualStyle === ASCII_STYLE_ID" class="sage-renderer__ascii" :style="asciiStyle" aria-hidden="true">{{ asciiFrame }}</pre>
+    <aside v-if="props.showPerformanceHud" class="sage-renderer__perf" aria-label="Performance debugger">
+      <div class="sage-renderer__perf-top">
+        <p>Performance</p>
+        <span>P</span>
+      </div>
+      <div class="sage-renderer__perf-grid">
+        <div class="sage-renderer__perf-card">
+          <span>FPS</span>
+          <strong :class="performanceToneClass">{{ performanceFps.toFixed(1) }}</strong>
+        </div>
+        <div class="sage-renderer__perf-card">
+          <span>Frame</span>
+          <strong>{{ performanceFrameMs.toFixed(1) }} ms</strong>
+        </div>
+        <div class="sage-renderer__perf-card">
+          <span>Render</span>
+          <strong>{{ performanceCanvasWidth }} x {{ performanceCanvasHeight }}</strong>
+        </div>
+        <div class="sage-renderer__perf-card">
+          <span>Viewport</span>
+          <strong>{{ performanceViewportWidth }} x {{ performanceViewportHeight }}</strong>
+        </div>
+        <div class="sage-renderer__perf-card">
+          <span>DPR</span>
+          <strong>{{ dpr.toFixed(2) }}</strong>
+        </div>
+        <div class="sage-renderer__perf-card">
+          <span>Qualidade</span>
+          <strong>{{ performanceQualityLabel }}</strong>
+        </div>
+        <div class="sage-renderer__perf-card">
+          <span>Style</span>
+          <strong>{{ performanceStyleLabel }}</strong>
+        </div>
+      </div>
+      <p class="sage-renderer__perf-footnote">{{ performanceSampleFrames }} frames analisados por janela</p>
+    </aside>
   </figure>
 </template>
 
@@ -524,7 +1086,7 @@ onBeforeUnmount(() => {
     radial-gradient(circle at 50% 50%, rgba(var(--flash-rgb, 255, 255, 255), var(--flash-alpha, 0.12)), transparent 42%),
     radial-gradient(circle at 50% 50%, rgba(var(--color-rgb, 101, 224, 255), var(--color-alpha, 0.08)), transparent 58%);
   mix-blend-mode: screen;
-  filter: blur(28px);
+  filter: blur(var(--overlay-blur, 0px));
 }
 
 .sage-renderer__fx {
@@ -550,6 +1112,105 @@ onBeforeUnmount(() => {
   text-rendering: geometricPrecision;
   background: #000;
   pointer-events: none;
+}
+
+.sage-renderer__perf {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  z-index: 4;
+  width: min(320px, calc(100vw - 36px));
+  padding: 14px;
+  color: #eff5ff;
+  background: rgba(5, 10, 18, 0.82);
+  border: 1px solid rgba(130, 183, 255, 0.18);
+  border-radius: 16px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(18px);
+  pointer-events: none;
+}
+
+.sage-renderer__perf-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.sage-renderer__perf-top p,
+.sage-renderer__perf-footnote {
+  margin: 0;
+}
+
+.sage-renderer__perf-top p {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: rgba(222, 235, 255, 0.88);
+}
+
+.sage-renderer__perf-top span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 8px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  border-radius: 999px;
+  color: rgba(234, 243, 255, 0.92);
+  background: rgba(125, 175, 255, 0.12);
+  border: 1px solid rgba(125, 175, 255, 0.2);
+}
+
+.sage-renderer__perf-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.sage-renderer__perf-card {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.sage-renderer__perf-card span {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(198, 213, 236, 0.72);
+}
+
+.sage-renderer__perf-card strong {
+  display: block;
+  font-size: 1rem;
+  line-height: 1.2;
+  color: #f5f8ff;
+}
+
+.sage-renderer__perf-card strong.is-good {
+  color: #87f0a8;
+}
+
+.sage-renderer__perf-card strong.is-warning {
+  color: #ffd173;
+}
+
+.sage-renderer__perf-card strong.is-bad {
+  color: #ff8d8d;
+}
+
+.sage-renderer__perf-footnote {
+  margin-top: 12px;
+  font-size: 0.76rem;
+  color: rgba(198, 213, 236, 0.74);
 }
 
 .style-ascii-bw .sage-renderer__canvas,

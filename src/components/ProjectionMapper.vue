@@ -441,6 +441,21 @@ function cloneValue(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function applySnapshot(snapshot) {
+  handlePointerUp();
+
+  const nextFaces = Array.isArray(snapshot?.faces) ? cloneValue(snapshot.faces) : [];
+  faces.value = nextFaces;
+
+  const selectedFaceIdCandidate = snapshot?.selectedFaceId ?? null;
+  selectedFaceId.value = nextFaces.some((face) => face.id === selectedFaceIdCandidate) ? selectedFaceIdCandidate : null;
+
+  const maxFaceId = nextFaces.reduce((highest, face) => Math.max(highest, Number(face?.id) || 0), 0);
+  const maxLayerOrder = nextFaces.reduce((highest, face) => Math.max(highest, Number(face?.layerOrder) || 0), 0);
+  nextFaceId = Math.max(1, maxFaceId + 1);
+  nextLayerOrder = Math.max(1, maxLayerOrder + 1);
+}
+
 function getStateSnapshot() {
   return {
     faces: cloneValue([...faces.value].sort((left, right) => Number(right.layerOrder || 0) - Number(left.layerOrder || 0))),
@@ -531,6 +546,7 @@ watch(
 );
 
 defineExpose({
+  applySnapshot,
   getStateSnapshot,
   applyCommand,
   clearAllFaces,
